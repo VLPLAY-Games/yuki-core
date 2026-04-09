@@ -1,3 +1,4 @@
+# core.py
 import asyncio
 import websockets
 import json
@@ -242,6 +243,9 @@ device_rate_limiters = {}
 webui_rate_limiters = {}
 rate_limit_lock = asyncio.Lock()
 # ----------------------------------------------------
+
+# Хранилище для ожидающих подтверждения команд (dangerous)
+pending_confirm_commands = {}
 
 async def wait_for_pending_authorization(device: Device, websocket) -> bool:
     auth_event = asyncio.Event()
@@ -491,20 +495,36 @@ async def handle_webui(websocket, path=None):
                     device_id = data["device_id"]
                     cmd = data["command"]
                     payload = data.get("payload", {})
+                    cmd_id = data.get("id")  # ID от WebUI
                     if cmd in DANGEROUS_COMMANDS:
+                        # Создаём уникальный ID для confirm сообщения
+                        confirm_id = str(uuid.uuid4())
+                        # Сохраняем информацию для последующего выполнения
+                        pending_confirm_commands[confirm_id] = {
+                            "webui_id": cmd_id,
+                            "device_id": device_id,
+                            "command": cmd,
+                            "params": payload
+                        }
+                        # Отправляем запрос подтверждения в WebUI
                         confirm_msg = confirm_command_message(device_id, cmd, payload)
+                        # Устанавливаем ID сообщения, чтобы WebUI вернул его в confirm_response
+                        confirm_msg.id = confirm_id
                         await websocket.send(confirm_msg.to_json())
                         continue
-                    await execute_command(device_id, cmd, payload)
+                    # Неопасная команда – выполняем сразу с ID от WebUI
+                    await execute_command(device_id, cmd, payload, cmd_id=cmd_id)
                 elif msg_type == "confirm_response":
-                    device_id = data.get("device_id")
-                    cmd = data.get("command")
-                    params = data.get("params", {})
+                    confirm_id = data.get("id")
                     approved = data.get("approved", False)
-                    if approved:
-                        await execute_command(device_id, cmd, params)
+                    if approved and confirm_id in pending_confirm_commands:
+                        info = pending_confirm_commands.pop(confirm_id)
+                        # Выполняем опасную команду, используя сохранённый webui_id
+                        await execute_command(info["device_id"], info["command"], info["params"], cmd_id=info["webui_id"])
                     else:
-                        logger.info(f"Command {cmd} for {device_id} rejected by user")
+                        # Отклонено или неизвестный ID – просто удаляем запись
+                        pending_confirm_commands.pop(confirm_id, None)
+                        logger.info(f"Command {data.get('command')} for {data.get('device_id')} rejected by user")
                 elif msg_type == "device_auth_response":
                     device_id = data.get("device_id")
                     approved = data.get("approved", False)
@@ -537,6 +557,8 @@ async def handle_webui(websocket, path=None):
                         # Отправляем устройству сообщение о намеренном отключении
                         try:
                             await device.ws.send(json.dumps({"type": "disconnect", "reason": "admin"}))
+                            # Даём время на доставку сообщения клиенту
+                            await asyncio.sleep(0.2)
                         except:
                             pass
                         await device.ws.close(1000, "Disconnected by admin")
@@ -550,8 +572,7 @@ async def handle_webui(websocket, path=None):
                         # Отправляем устройству запрос на переподключение
                         try:
                             await device.ws.send(json.dumps({"type": "reconnect"}))
-                            # Даём время на обработку, затем закрываем соединение
-                            await asyncio.sleep(0.5)
+                            await asyncio.sleep(0.2)
                         except:
                             pass
                         await device.ws.close(1000, "Reconnect requested by admin")
@@ -570,6 +591,7 @@ async def handle_webui(websocket, path=None):
                     if device and device.ws:
                         try:
                             await device.ws.send(json.dumps({"type": "disconnect", "reason": "removed"}))
+                            await asyncio.sleep(0.2)
                         except:
                             pass
                         await device.ws.close(1000, "Removed by admin")
@@ -605,14 +627,27 @@ async def handle_webui(websocket, path=None):
         async with rate_limit_lock:
             webui_rate_limiters.pop(ws_id, None)
 
-async def execute_command(device_id: str, cmd: str, payload: dict):
+async def execute_command(device_id: str, cmd: str, payload: dict, cmd_id: str = None):
     async with lock:
         device = connected_devices.get(device_id)
     if device and device.status == "online":
-        cmd_msg = command_message(device_id, cmd, payload)
-        success = await device.send_json(cmd_msg.to_json())
+        # Если cmd_id не передан (например, при вызове из других мест), генерируем новый
+        if cmd_id is None:
+            cmd_id = str(uuid.uuid4())
+        # Формируем command_message вручную, чтобы сохранить нужный ID
+        cmd_msg = {
+            "protocol": "yuki/1.0",
+            "type": "command",
+            "id": cmd_id,
+            "timestamp": int(time.time()),
+            "payload": {
+                "command": cmd,
+                "params": payload
+            }
+        }
+        success = await device.send_json(json.dumps(cmd_msg))
         if success:
-            logger.info(f"Command sent to {device_id}: {cmd}")
+            logger.info(f"Command sent to {device_id}: {cmd} (id={cmd_id})")
         else:
             logger.error(f"Failed to send command to {device_id}")
     else:
