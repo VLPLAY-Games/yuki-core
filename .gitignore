@@ -3,3 +3,4 @@ __pycache__/
 logs/
 .token
 authorized_devices.json
+.token_meta

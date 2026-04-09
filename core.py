@@ -8,6 +8,7 @@ import os
 import secrets
 import string
 from contextlib import suppress
+from datetime import datetime, timedelta
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'yuki-protocol')))
 
@@ -62,28 +63,122 @@ load_authorized()
 HEARTBEAT_INTERVAL = 30
 HEARTBEAT_TIMEOUT = 10
 AUTH_TIMEOUT = 60
-AUTH_TOKEN = os.environ.get("YUKI_AUTH_TOKEN")
-if not AUTH_TOKEN:
-    token_file = os.path.join(os.path.dirname(__file__), ".token")
-    if os.path.exists(token_file):
-        with open(token_file, "r", encoding="utf-8") as f:
-            AUTH_TOKEN = f.read().strip()
-    else:
-        alphabet = string.ascii_letters + string.digits
-        AUTH_TOKEN = ''.join(secrets.choice(alphabet) for _ in range(32))
-        with open(token_file, "w", encoding="utf-8") as f:
-            f.write(AUTH_TOKEN)
-        print("\n" + "=" * 60)
-        print("Yuki Core: Generated new authentication token")
-        print(f"   Token: {AUTH_TOKEN}")
-        print(f"   Saved to: {token_file}")
-        print("   Use this token in your devices to connect.")
-        print("=" * 60 + "\n")
 
-if AUTH_TOKEN:
-    logger.info("Authentication enabled (token required)")
-else:
-    logger.warn("Authentication disabled")
+# ------------------ Ротация токенов ------------------
+TOKEN_FILE = os.path.join(os.path.dirname(__file__), ".token")
+TOKEN_META_FILE = os.path.join(os.path.dirname(__file__), ".token_meta")
+ROTATION_INTERVAL_HOURS = int(os.environ.get("YUKI_TOKEN_ROTATION_HOURS", "24"))  # по умолчанию 24 часа
+
+current_token = None
+token_created_at = None
+
+def load_token():
+    global current_token, token_created_at
+    # Пытаемся загрузить токен из переменной окружения
+    env_token = os.environ.get("YUKI_AUTH_TOKEN")
+    if env_token:
+        current_token = env_token
+        # Если токен из окружения, считаем его статичным (без ротации)
+        token_created_at = None
+        logger.info("Using authentication token from environment variable (rotation disabled)")
+        return
+
+    # Иначе работаем с файлом .token
+    if os.path.exists(TOKEN_FILE):
+        with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+            current_token = f.read().strip()
+    else:
+        current_token = None
+
+    # Загружаем метаданные (дату создания)
+    if os.path.exists(TOKEN_META_FILE):
+        try:
+            with open(TOKEN_META_FILE, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+                token_created_at = meta.get("created_at")
+        except:
+            token_created_at = None
+    else:
+        token_created_at = None
+
+    if not current_token:
+        generate_new_token(save=True)
+
+def save_token_meta():
+    if token_created_at is not None:
+        try:
+            with open(TOKEN_META_FILE, "w", encoding="utf-8") as f:
+                json.dump({"created_at": token_created_at}, f)
+        except Exception as e:
+            logger.error(f"Failed to save token metadata: {e}")
+
+def generate_new_token(save=True):
+    global current_token, token_created_at
+    alphabet = string.ascii_letters + string.digits
+    current_token = ''.join(secrets.choice(alphabet) for _ in range(32))
+    token_created_at = time.time()
+    if save:
+        try:
+            with open(TOKEN_FILE, "w", encoding="utf-8") as f:
+                f.write(current_token)
+            save_token_meta()
+        except Exception as e:
+            logger.error(f"Failed to save token: {e}")
+    logger.info(f"Generated new authentication token (created at {datetime.fromtimestamp(token_created_at)})")
+    return current_token
+
+def is_token_expired():
+    if token_created_at is None:
+        return False  # токен из окружения или без метаданных
+    age = time.time() - token_created_at
+    return age > ROTATION_INTERVAL_HOURS * 3600
+
+async def rotate_token_if_needed():
+    """Проверяет необходимость ротации по времени и выполняет её."""
+    if is_token_expired():
+        logger.info("Token expired, rotating...")
+        await perform_token_rotation(reason="time")
+
+async def perform_token_rotation(reason="admin"):
+    """Генерирует новый токен и рассылает его всем подключённым устройствам."""
+    global current_token
+    old_token = current_token
+    new_token = generate_new_token(save=True)
+    logger.info(f"Token rotated ({reason}). New token generated.")
+
+    # Рассылаем новый токен всем онлайн-устройствам
+    async with lock:
+        devices = list(connected_devices.values())
+    if devices:
+        update_msg = {
+            "type": "token_update",
+            "payload": {
+                "new_token": new_token,
+                "reason": reason
+            }
+        }
+        json_msg = json.dumps(update_msg)
+        for device in devices:
+            if device.ws and device.status == "online":
+                try:
+                    await device.ws.send(json_msg)
+                    logger.debug(f"Sent new token to device {device.id}")
+                except Exception as e:
+                    logger.warn(f"Failed to send new token to {device.id}: {e}")
+
+    # Для офлайн-устройств токен останется старым, при следующем подключении они будут отвергнуты
+    return new_token
+
+# Загружаем токен при старте
+load_token()
+
+# Фоновая задача для проверки ротации по времени
+async def token_rotation_scheduler():
+    while True:
+        await asyncio.sleep(3600)  # проверяем каждый час
+        await rotate_token_if_needed()
+
+# ----------------------------------------------------
 
 DANGEROUS_COMMANDS = {"shutdown", "restart", "sleep", "hibernate", "lock"}
 
@@ -132,7 +227,9 @@ async def handle_device(websocket, path=None):
         if not device_id or not device_type:
             await websocket.close(1003, "Missing device_id or device_type")
             return
-        if AUTH_TOKEN and auth_token != AUTH_TOKEN:
+
+        # Проверка токена (если задан)
+        if current_token and auth_token != current_token:
             logger.warn(f"Device {device_id} rejected: invalid auth token")
             await websocket.close(1008, "Invalid authentication token")
             return
@@ -172,7 +269,6 @@ async def handle_device(websocket, path=None):
             approved = await wait_for_pending_authorization(device, websocket)
             if not approved:
                 await websocket.close(1000, "Authorization rejected or timeout")
-                # Устройство остаётся в known_devices со статусом rejected
                 device.status = "rejected"
                 await notify_webui()
                 return
@@ -221,7 +317,6 @@ async def handle_device(websocket, path=None):
                 # Помечаем устройство как offline, если оно не было удалено намеренно
                 if device_id in known_devices:
                     dev = known_devices[device_id]
-                    # Если статус не rejected и не отключён админом, ставим offline
                     if dev.status not in ("rejected", "offline"):
                         dev.mark_offline()
                     dev.ws = None
@@ -350,12 +445,29 @@ async def handle_webui(websocket, path=None):
                     async with lock:
                         device = connected_devices.get(device_id)
                         if device_id in known_devices:
-                            # Полностью удаляем из известных устройств
                             del known_devices[device_id]
                     if device:
                         await device.ws.close(1000, "Removed by admin")
                         logger.info(f"Device {device_id} removed from authorized and disconnected")
                     await notify_webui()
+                elif msg_type == "rotate_token":
+                    # Команда от WebUI для ручной ротации токена
+                    await perform_token_rotation(reason="admin")
+                    await websocket.send(json.dumps({"type": "token_rotated", "success": True}))
+                elif msg_type == "get_token_info":
+                    # Возвращаем информацию о текущем токене (дата создания)
+                    info = {
+                        "type": "token_info",
+                        "payload": {
+                            "created_at": token_created_at,
+                            "rotation_interval_hours": ROTATION_INTERVAL_HOURS,
+                            "expires_in": None
+                        }
+                    }
+                    if token_created_at:
+                        expires_at = token_created_at + ROTATION_INTERVAL_HOURS * 3600
+                        info["payload"]["expires_in"] = max(0, expires_at - time.time())
+                    await websocket.send(json.dumps(info))
             except json.JSONDecodeError:
                 logger.warn("Invalid JSON from WebUI")
             except Exception as e:
@@ -436,6 +548,9 @@ async def broadcast_to_webui(message: str):
                 webui_clients.discard(ws)
 
 async def main():
+    # Запускаем фоновую задачу ротации токенов
+    asyncio.create_task(token_rotation_scheduler())
+
     async def router(websocket, path=None):
         if path is None:
             path = getattr(getattr(websocket, "request", None), "path", None) or getattr(websocket, "path", None)
