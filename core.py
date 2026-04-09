@@ -7,6 +7,7 @@ import sys
 import os
 import secrets
 import string
+from contextlib import suppress
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'yuki-protocol')))
 
@@ -14,72 +15,106 @@ from yuki_protocol import (
     YukiMessage, PROTOCOL_VERSION,
     hello_message, welcome_message, command_message,
     command_result_message, status_message, devices_update_message,
-    confirm_command_message, device_auth_request_message, device_auth_response_message
+    confirm_command_message, device_auth_request_message
 )
 import logger
 from device import Device
 
-# Глобальное состояние
+# Активные WebSocket соединения (ключ = device_id)
 connected_devices = {}
+# Все известные устройства (ключ = device_id, объект Device)
+known_devices = {}
 webui_clients = set()
 lock = asyncio.Lock()
-
-# Очередь ожидающих авторизации устройств: request_id -> (websocket, device_id, device_type, capabilities)
 pending_devices = {}
+pending_auth_events = {}
+AUTHORIZED_FILE = os.path.join(os.path.dirname(__file__), "authorized_devices.json")
+authorized_devices_set = set()
+
+def load_authorized():
+    global authorized_devices_set
+    if os.path.exists(AUTHORIZED_FILE):
+        try:
+            with open(AUTHORIZED_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    authorized_devices_set = set(data.get("devices", []))
+                elif isinstance(data, list):
+                    authorized_devices_set = set(data)
+                else:
+                    authorized_devices_set = set()
+            logger.info(f"Loaded {len(authorized_devices_set)} authorized devices")
+        except Exception as e:
+            logger.error(f"Failed to load authorized devices: {e}")
+            authorized_devices_set = set()
+    else:
+        authorized_devices_set = set()
+
+def save_authorized():
+    try:
+        with open(AUTHORIZED_FILE, "w", encoding="utf-8") as f:
+            json.dump({"devices": list(authorized_devices_set)}, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"Failed to save authorized devices: {e}")
+
+load_authorized()
 
 HEARTBEAT_INTERVAL = 30
 HEARTBEAT_TIMEOUT = 10
-
-# --- Аутентификация по токену ---
+AUTH_TIMEOUT = 60
 AUTH_TOKEN = os.environ.get("YUKI_AUTH_TOKEN")
 if not AUTH_TOKEN:
     token_file = os.path.join(os.path.dirname(__file__), ".token")
     if os.path.exists(token_file):
-        with open(token_file, "r") as f:
+        with open(token_file, "r", encoding="utf-8") as f:
             AUTH_TOKEN = f.read().strip()
     else:
         alphabet = string.ascii_letters + string.digits
         AUTH_TOKEN = ''.join(secrets.choice(alphabet) for _ in range(32))
-        with open(token_file, "w") as f:
+        with open(token_file, "w", encoding="utf-8") as f:
             f.write(AUTH_TOKEN)
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("Yuki Core: Generated new authentication token")
         print(f"   Token: {AUTH_TOKEN}")
         print(f"   Saved to: {token_file}")
         print("   Use this token in your devices to connect.")
-        print("="*60 + "\n")
+        print("=" * 60 + "\n")
 
 if AUTH_TOKEN:
     logger.info("Authentication enabled (token required)")
 else:
-    logger.warn("Authentication disabled – set YUKI_AUTH_TOKEN or create .token file")
+    logger.warn("Authentication disabled")
 
-# --- Список авторизованных устройств (сохраняется в файл) ---
-AUTHORIZED_DEVICES_FILE = os.path.join(os.path.dirname(__file__), "authorized_devices.json")
-
-def load_authorized_devices():
-    if os.path.exists(AUTHORIZED_DEVICES_FILE):
-        try:
-            with open(AUTHORIZED_DEVICES_FILE, "r") as f:
-                return set(json.load(f))
-        except:
-            return set()
-    return set()
-
-def save_authorized_device(device_id):
-    authorized = load_authorized_devices()
-    authorized.add(device_id)
-    with open(AUTHORIZED_DEVICES_FILE, "w") as f:
-        json.dump(list(authorized), f)
-
-authorized_devices = load_authorized_devices()
-
-# Список опасных команд, требующих подтверждения
 DANGEROUS_COMMANDS = {"shutdown", "restart", "sleep", "hibernate", "lock"}
 
-async def handle_device(websocket, path):
+async def wait_for_pending_authorization(device: Device, websocket) -> bool:
+    auth_event = asyncio.Event()
+    async with lock:
+        pending_auth_events[device.id] = auth_event
+    try:
+        wait_auth = asyncio.create_task(auth_event.wait())
+        wait_close = asyncio.create_task(websocket.wait_closed())
+        done, pending = await asyncio.wait(
+            {wait_auth, wait_close},
+            timeout=AUTH_TIMEOUT,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+        with suppress(Exception):
+            await asyncio.gather(*pending, return_exceptions=True)
+        if not done or wait_close in done:
+            return False
+        return device.status == "online"
+    finally:
+        async with lock:
+            pending_auth_events.pop(device.id, None)
+
+async def handle_device(websocket, path=None):
     device_id = None
-    pending_request_id = None
+    device = None
+    receive_task = None
+    heartbeat_task = None
     try:
         raw_init = await asyncio.wait_for(websocket.recv(), timeout=5.0)
         try:
@@ -90,77 +125,75 @@ async def handle_device(websocket, path):
         except ValueError as e:
             await websocket.close(1003, f"Invalid protocol: {e}")
             return
-
         device_id = init_msg.payload.get("device_id")
         device_type = init_msg.payload.get("device_type")
         capabilities = init_msg.payload.get("capabilities", [])
         auth_token = init_msg.payload.get("auth_token")
-
         if not device_id or not device_type:
             await websocket.close(1003, "Missing device_id or device_type")
             return
-
-        # Проверка аутентификации по токену
         if AUTH_TOKEN and auth_token != AUTH_TOKEN:
             logger.warn(f"Device {device_id} rejected: invalid auth token")
             await websocket.close(1008, "Invalid authentication token")
             return
 
-        # Проверка, авторизовано ли устройство
-        if device_id not in authorized_devices:
-            logger.info(f"Device {device_id} requires authorization")
-            # Создаём запрос авторизации
-            request_id = str(uuid.uuid4())
-            pending_devices[request_id] = (websocket, device_id, device_type, capabilities)
-            pending_request_id = request_id
-
-            # Отправляем запрос всем WebUI
-            auth_req = device_auth_request_message(device_id, device_type, capabilities)
-            auth_req.id = request_id  # используем как ID запроса
-            await notify_webui_with_message(auth_req)
-
-            # Ждём ответа (с таймаутом 60 секунд)
-            try:
-                # Ожидаем, пока другой обработчик не вызовет approve/reject
-                # Реализуем через asyncio.Event
-                event = asyncio.Event()
-                pending_devices[request_id] = (websocket, device_id, device_type, capabilities, event)
-                await asyncio.wait_for(event.wait(), timeout=60.0)
-                # Если событие установлено – авторизация одобрена
-                authorized_devices.add(device_id)
-                save_authorized_device(device_id)
-                logger.info(f"Device {device_id} authorized by user")
-            except asyncio.TimeoutError:
-                logger.warn(f"Authorization timeout for device {device_id}")
-                await websocket.close(1008, "Authorization timeout")
-                return
-            finally:
-                if request_id in pending_devices:
-                    del pending_devices[request_id]
-
-        # Если дошли сюда – устройство авторизовано
-        device = Device(device_id, device_type, websocket, capabilities)
+        # Проверяем, есть ли уже известное устройство с таким ID
         async with lock:
-            connected_devices[device_id] = device
-        logger.info(f"Device connected: {device_id} ({device_type}) capabilities: {capabilities}")
+            if device_id in known_devices:
+                # Переиспользуем существующий объект, обновляем данные
+                device = known_devices[device_id]
+                device.ws = websocket
+                device.type = device_type  # на случай изменения типа
+                device.capabilities = capabilities
+                device.authorized = device_id in authorized_devices_set
+                if not device.authorized:
+                    device.status = "pending"
+                    pending_devices[device_id] = device
+                else:
+                    device.status = "online"
+                device.update_last_seen()
+            else:
+                is_authorized = device_id in authorized_devices_set
+                device = Device(device_id, device_type, websocket, capabilities, authorized=is_authorized)
+                known_devices[device_id] = device
+                if not is_authorized:
+                    device.status = "pending"
+                    pending_devices[device_id] = device
+                else:
+                    device.status = "online"
 
-        welcome = welcome_message(
-            session_id=str(uuid.uuid4()),
-            server_time=int(time.time()),
-            heartbeat_interval=HEARTBEAT_INTERVAL
-        )
-        await websocket.send(welcome.to_json())
+            connected_devices[device_id] = device
+
+        if device.status == "pending":
+            logger.info(f"Device {device_id} ({device_type}) is pending authorization")
+            await notify_webui()
+            auth_req = device_auth_request_message(device_id, device_type, capabilities)
+            await broadcast_to_webui(auth_req.to_json())
+            approved = await wait_for_pending_authorization(device, websocket)
+            if not approved:
+                await websocket.close(1000, "Authorization rejected or timeout")
+                # Устройство остаётся в known_devices со статусом rejected
+                device.status = "rejected"
+                await notify_webui()
+                return
+            await complete_handshake(device)
+        else:
+            # Уже авторизовано – завершаем рукопожатие
+            await complete_handshake(device)
+
+        # Уведомляем WebUI о новом или обновлённом устройстве
         await notify_webui()
 
         receive_task = asyncio.create_task(device_receive_loop(device))
         heartbeat_task = asyncio.create_task(heartbeat_monitor(device))
-
         done, pending = await asyncio.wait(
             [receive_task, heartbeat_task],
             return_when=asyncio.FIRST_COMPLETED
         )
         for task in pending:
             task.cancel()
+            with suppress(Exception):
+                await task
     except asyncio.TimeoutError:
         logger.warn("Device handshake timeout")
     except websockets.exceptions.ConnectionClosed:
@@ -168,14 +201,42 @@ async def handle_device(websocket, path):
     except Exception as e:
         logger.error(f"Unexpected error in handle_device: {e}")
     finally:
-        if pending_request_id and pending_request_id in pending_devices:
-            del pending_devices[pending_request_id]
+        for task in (receive_task, heartbeat_task):
+            if task and not task.done():
+                task.cancel()
+                with suppress(Exception):
+                    await task
+
         async with lock:
-            if device_id and device_id in connected_devices:
-                del connected_devices[device_id]
+            if device_id:
+                # Удаляем из активных соединений, но оставляем в known_devices
+                if device_id in connected_devices:
+                    del connected_devices[device_id]
+                if device_id in pending_devices:
+                    del pending_devices[device_id]
+                if device_id in pending_auth_events:
+                    pending_auth_events[device_id].set()
+                    del pending_auth_events[device_id]
+
+                # Помечаем устройство как offline, если оно не было удалено намеренно
+                if device_id in known_devices:
+                    dev = known_devices[device_id]
+                    # Если статус не rejected и не отключён админом, ставим offline
+                    if dev.status not in ("rejected", "offline"):
+                        dev.mark_offline()
+                    dev.ws = None
+
         logger.info(f"Device {device_id} disconnected")
         await notify_webui()
 
+async def complete_handshake(device: Device):
+    welcome = welcome_message(
+        session_id=str(uuid.uuid4()),
+        server_time=int(time.time()),
+        heartbeat_interval=HEARTBEAT_INTERVAL
+    )
+    await device.ws.send(welcome.to_json())
+    logger.info(f"Handshake completed for {device.id}")
 
 async def device_receive_loop(device: Device):
     try:
@@ -185,7 +246,6 @@ async def device_receive_loop(device: Device):
             except ValueError as e:
                 logger.warn(f"Invalid message from {device.id}: {e}")
                 continue
-
             if msg.type == "status":
                 new_status = msg.payload.get("status", device.status)
                 if device.update_status(new_status):
@@ -207,7 +267,6 @@ async def device_receive_loop(device: Device):
                 del connected_devices[device.id]
         await notify_webui()
 
-
 async def heartbeat_monitor(device: Device):
     try:
         while True:
@@ -226,58 +285,81 @@ async def heartbeat_monitor(device: Device):
     except Exception as e:
         logger.error(f"Heartbeat monitor error for {device.id}: {e}")
 
-
-async def handle_webui(websocket, path):
+async def handle_webui(websocket, path=None):
     async with lock:
         webui_clients.add(websocket)
     try:
         await send_devices_to_webui(websocket)
-
         async for message in websocket:
             try:
                 data = json.loads(message)
                 msg_type = data.get("type")
-
                 if msg_type == "command":
                     device_id = data["device_id"]
                     cmd = data["command"]
                     payload = data.get("payload", {})
-
                     if cmd in DANGEROUS_COMMANDS:
                         confirm_msg = confirm_command_message(device_id, cmd, payload)
                         await websocket.send(confirm_msg.to_json())
                         continue
-
                     await execute_command(device_id, cmd, payload)
-
                 elif msg_type == "confirm_response":
-                    original_id = data.get("id")
-                    approved = data.get("approved", False)
                     device_id = data.get("device_id")
                     cmd = data.get("command")
                     params = data.get("params", {})
+                    approved = data.get("approved", False)
                     if approved:
                         await execute_command(device_id, cmd, params)
                     else:
                         logger.info(f"Command {cmd} for {device_id} rejected by user")
-
                 elif msg_type == "device_auth_response":
-                    request_id = data.get("id")
+                    device_id = data.get("device_id")
                     approved = data.get("approved", False)
-                    if request_id in pending_devices:
-                        _, _, _, _, event = pending_devices[request_id]
+                    async with lock:
+                        device = pending_devices.get(device_id) or known_devices.get(device_id)
+                        auth_event = pending_auth_events.get(device_id)
+                    if device and device.status == "pending":
                         if approved:
-                            event.set()
+                            authorized_devices_set.add(device_id)
+                            save_authorized()
+                            device.authorized = True
+                            device.status = "online"
+                            logger.info(f"Device {device_id} approved and added to whitelist")
                         else:
-                            # Отклонено – закроем соединение
-                            websocket_obj, device_id, _, _, _ = pending_devices[request_id]
-                            await websocket_obj.close(1008, "Authorization rejected")
-                        del pending_devices[request_id]
-                    else:
-                        logger.warn(f"Unknown auth request id: {request_id}")
-
+                            device.status = "rejected"
+                            logger.info(f"Device {device_id} rejected")
+                        if auth_event:
+                            auth_event.set()
+                        if not approved:
+                            with suppress(Exception):
+                                await device.ws.close(1000, "Authorization rejected")
+                    await notify_webui()
+                elif msg_type == "disconnect_device":
+                    device_id = data.get("device_id")
+                    async with lock:
+                        device = connected_devices.get(device_id)
+                    if device:
+                        await device.ws.close(1000, "Disconnected by admin")
+                        logger.info(f"Device {device_id} disconnected by admin")
+                    await notify_webui()
+                elif msg_type == "remove_device":
+                    device_id = data.get("device_id")
+                    if device_id in authorized_devices_set:
+                        authorized_devices_set.remove(device_id)
+                        save_authorized()
+                    async with lock:
+                        device = connected_devices.get(device_id)
+                        if device_id in known_devices:
+                            # Полностью удаляем из известных устройств
+                            del known_devices[device_id]
+                    if device:
+                        await device.ws.close(1000, "Removed by admin")
+                        logger.info(f"Device {device_id} removed from authorized and disconnected")
+                    await notify_webui()
             except json.JSONDecodeError:
                 logger.warn("Invalid JSON from WebUI")
+            except Exception as e:
+                logger.error(f"WebUI message handling error: {e}")
     except websockets.exceptions.ConnectionClosed:
         logger.info("WebUI disconnected")
     except Exception as e:
@@ -286,11 +368,10 @@ async def handle_webui(websocket, path):
         async with lock:
             webui_clients.discard(websocket)
 
-
 async def execute_command(device_id: str, cmd: str, payload: dict):
     async with lock:
         device = connected_devices.get(device_id)
-    if device:
+    if device and device.status == "online":
         cmd_msg = command_message(device_id, cmd, payload)
         success = await device.send_json(cmd_msg.to_json())
         if success:
@@ -298,66 +379,75 @@ async def execute_command(device_id: str, cmd: str, payload: dict):
         else:
             logger.error(f"Failed to send command to {device_id}")
     else:
-        logger.warn(f"Command to unknown device {device_id}")
-
+        logger.warn(f"Command to unknown or offline device {device_id}")
 
 async def send_devices_to_webui(ws):
     devices_info = {}
-    for d in connected_devices.values():
-        devices_info[d.id] = {
-            "type": d.type,
-            "status": d.status,
-            "capabilities": d.capabilities,
-            "last_seen": d.last_seen
-        }
+    async with lock:
+        for d in known_devices.values():
+            devices_info[d.id] = {
+                "type": d.type,
+                "status": d.status,
+                "capabilities": d.capabilities,
+                "authorized": d.authorized,
+                "last_seen": d.last_seen
+            }
     msg = devices_update_message(devices_info)
     await ws.send(msg.to_json())
 
-
 async def notify_webui():
-    if not webui_clients:
+    async with lock:
+        clients = list(webui_clients)
+        devices_snapshot = list(known_devices.values())
+    if not clients:
         return
     devices_info = {}
-    for d in connected_devices.values():
+    for d in devices_snapshot:
         devices_info[d.id] = {
             "type": d.type,
             "status": d.status,
             "capabilities": d.capabilities,
+            "authorized": d.authorized,
             "last_seen": d.last_seen
         }
     msg = devices_update_message(devices_info)
     json_msg = msg.to_json()
-    await asyncio.gather(
-        *[ws.send(json_msg) for ws in webui_clients],
+    results = await asyncio.gather(
+        *[ws.send(json_msg) for ws in clients],
         return_exceptions=True
     )
+    async with lock:
+        for ws, result in zip(clients, results):
+            if isinstance(result, Exception):
+                webui_clients.discard(ws)
 
-
-async def notify_webui_with_message(msg: YukiMessage):
-    """Отправляет произвольное сообщение всем WebUI."""
-    if not webui_clients:
+async def broadcast_to_webui(message: str):
+    async with lock:
+        clients = list(webui_clients)
+    if not clients:
         return
-    json_msg = msg.to_json()
-    await asyncio.gather(
-        *[ws.send(json_msg) for ws in webui_clients],
+    results = await asyncio.gather(
+        *[ws.send(message) for ws in clients],
         return_exceptions=True
     )
-
+    async with lock:
+        for ws, result in zip(clients, results):
+            if isinstance(result, Exception):
+                webui_clients.discard(ws)
 
 async def main():
-    async def router(websocket):
-        path = websocket.request.path if hasattr(websocket, 'request') else websocket.path
+    async def router(websocket, path=None):
+        if path is None:
+            path = getattr(getattr(websocket, "request", None), "path", None) or getattr(websocket, "path", None)
         if path == "/device":
             await handle_device(websocket, path)
         elif path == "/webui":
             await handle_webui(websocket, path)
         else:
             await websocket.close(1008, "Invalid path")
-
     server = await websockets.serve(router, "0.0.0.0", 8000)
     logger.info("Yuki Core WebSocket server started on ws://0.0.0.0:8000")
     await server.wait_closed()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
