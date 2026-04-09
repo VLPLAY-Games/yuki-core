@@ -14,7 +14,7 @@ from yuki_protocol import (
     YukiMessage, PROTOCOL_VERSION,
     hello_message, welcome_message, command_message,
     command_result_message, status_message, devices_update_message,
-    confirm_command_message
+    confirm_command_message, device_auth_request_message, device_auth_response_message
 )
 import logger
 from device import Device
@@ -24,9 +24,13 @@ connected_devices = {}
 webui_clients = set()
 lock = asyncio.Lock()
 
+# Очередь ожидающих авторизации устройств: request_id -> (websocket, device_id, device_type, capabilities)
+pending_devices = {}
+
 HEARTBEAT_INTERVAL = 30
 HEARTBEAT_TIMEOUT = 10
 
+# --- Аутентификация по токену ---
 AUTH_TOKEN = os.environ.get("YUKI_AUTH_TOKEN")
 if not AUTH_TOKEN:
     token_file = os.path.join(os.path.dirname(__file__), ".token")
@@ -50,11 +54,32 @@ if AUTH_TOKEN:
 else:
     logger.warn("Authentication disabled – set YUKI_AUTH_TOKEN or create .token file")
 
+# --- Список авторизованных устройств (сохраняется в файл) ---
+AUTHORIZED_DEVICES_FILE = os.path.join(os.path.dirname(__file__), "authorized_devices.json")
+
+def load_authorized_devices():
+    if os.path.exists(AUTHORIZED_DEVICES_FILE):
+        try:
+            with open(AUTHORIZED_DEVICES_FILE, "r") as f:
+                return set(json.load(f))
+        except:
+            return set()
+    return set()
+
+def save_authorized_device(device_id):
+    authorized = load_authorized_devices()
+    authorized.add(device_id)
+    with open(AUTHORIZED_DEVICES_FILE, "w") as f:
+        json.dump(list(authorized), f)
+
+authorized_devices = load_authorized_devices()
+
 # Список опасных команд, требующих подтверждения
 DANGEROUS_COMMANDS = {"shutdown", "restart", "sleep", "hibernate", "lock"}
 
 async def handle_device(websocket, path):
     device_id = None
+    pending_request_id = None
     try:
         raw_init = await asyncio.wait_for(websocket.recv(), timeout=5.0)
         try:
@@ -75,12 +100,45 @@ async def handle_device(websocket, path):
             await websocket.close(1003, "Missing device_id or device_type")
             return
 
-        # Проверка аутентификации
+        # Проверка аутентификации по токену
         if AUTH_TOKEN and auth_token != AUTH_TOKEN:
             logger.warn(f"Device {device_id} rejected: invalid auth token")
             await websocket.close(1008, "Invalid authentication token")
             return
 
+        # Проверка, авторизовано ли устройство
+        if device_id not in authorized_devices:
+            logger.info(f"Device {device_id} requires authorization")
+            # Создаём запрос авторизации
+            request_id = str(uuid.uuid4())
+            pending_devices[request_id] = (websocket, device_id, device_type, capabilities)
+            pending_request_id = request_id
+
+            # Отправляем запрос всем WebUI
+            auth_req = device_auth_request_message(device_id, device_type, capabilities)
+            auth_req.id = request_id  # используем как ID запроса
+            await notify_webui_with_message(auth_req)
+
+            # Ждём ответа (с таймаутом 60 секунд)
+            try:
+                # Ожидаем, пока другой обработчик не вызовет approve/reject
+                # Реализуем через asyncio.Event
+                event = asyncio.Event()
+                pending_devices[request_id] = (websocket, device_id, device_type, capabilities, event)
+                await asyncio.wait_for(event.wait(), timeout=60.0)
+                # Если событие установлено – авторизация одобрена
+                authorized_devices.add(device_id)
+                save_authorized_device(device_id)
+                logger.info(f"Device {device_id} authorized by user")
+            except asyncio.TimeoutError:
+                logger.warn(f"Authorization timeout for device {device_id}")
+                await websocket.close(1008, "Authorization timeout")
+                return
+            finally:
+                if request_id in pending_devices:
+                    del pending_devices[request_id]
+
+        # Если дошли сюда – устройство авторизовано
         device = Device(device_id, device_type, websocket, capabilities)
         async with lock:
             connected_devices[device_id] = device
@@ -110,6 +168,8 @@ async def handle_device(websocket, path):
     except Exception as e:
         logger.error(f"Unexpected error in handle_device: {e}")
     finally:
+        if pending_request_id and pending_request_id in pending_devices:
+            del pending_devices[pending_request_id]
         async with lock:
             if device_id and device_id in connected_devices:
                 del connected_devices[device_id]
@@ -183,9 +243,7 @@ async def handle_webui(websocket, path):
                     cmd = data["command"]
                     payload = data.get("payload", {})
 
-                    # Проверка на опасную команду
                     if cmd in DANGEROUS_COMMANDS:
-                        # Отправляем запрос подтверждения в WebUI
                         confirm_msg = confirm_command_message(device_id, cmd, payload)
                         await websocket.send(confirm_msg.to_json())
                         continue
@@ -195,9 +253,6 @@ async def handle_webui(websocket, path):
                 elif msg_type == "confirm_response":
                     original_id = data.get("id")
                     approved = data.get("approved", False)
-                    # Здесь нужно найти ожидающую подтверждения команду (упрощённо: передаём original_id в payload)
-                    # В реальной реализации нужно хранить карту запросов, но для простоты считаем, что
-                    # confirm_response содержит device_id, command, params
                     device_id = data.get("device_id")
                     cmd = data.get("command")
                     params = data.get("params", {})
@@ -205,6 +260,22 @@ async def handle_webui(websocket, path):
                         await execute_command(device_id, cmd, params)
                     else:
                         logger.info(f"Command {cmd} for {device_id} rejected by user")
+
+                elif msg_type == "device_auth_response":
+                    request_id = data.get("id")
+                    approved = data.get("approved", False)
+                    if request_id in pending_devices:
+                        _, _, _, _, event = pending_devices[request_id]
+                        if approved:
+                            event.set()
+                        else:
+                            # Отклонено – закроем соединение
+                            websocket_obj, device_id, _, _, _ = pending_devices[request_id]
+                            await websocket_obj.close(1008, "Authorization rejected")
+                        del pending_devices[request_id]
+                    else:
+                        logger.warn(f"Unknown auth request id: {request_id}")
+
             except json.JSONDecodeError:
                 logger.warn("Invalid JSON from WebUI")
     except websockets.exceptions.ConnectionClosed:
@@ -255,6 +326,17 @@ async def notify_webui():
             "last_seen": d.last_seen
         }
     msg = devices_update_message(devices_info)
+    json_msg = msg.to_json()
+    await asyncio.gather(
+        *[ws.send(json_msg) for ws in webui_clients],
+        return_exceptions=True
+    )
+
+
+async def notify_webui_with_message(msg: YukiMessage):
+    """Отправляет произвольное сообщение всем WebUI."""
+    if not webui_clients:
+        return
     json_msg = msg.to_json()
     await asyncio.gather(
         *[ws.send(json_msg) for ws in webui_clients],
