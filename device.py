@@ -3,11 +3,12 @@ import time
 import websockets
 
 class Device:
-    def __init__(self, device_id, device_type, websocket):
+    def __init__(self, device_id, device_type, websocket, capabilities=None):
         self.id = device_id
         self.type = device_type
         self.ws = websocket
         self.status = "online"
+        self.capabilities = capabilities or []
         self.last_seen = time.time()
 
     def update_status(self, new_status):
@@ -31,11 +32,3 @@ class Device:
         except Exception:
             self.status = "error"
             return False
-
-    async def send_command(self, command: str, payload: dict = None) -> bool:
-        msg = {
-            "type": "command",
-            "command": command,
-            "payload": payload or {}
-        }
-        return await self.send_json(msg)

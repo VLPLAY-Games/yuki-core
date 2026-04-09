@@ -6,26 +6,41 @@ import time
 import sys
 import os
 
-# Добавляем путь к yuki-protocol
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'yuki-protocol')))
 
 from yuki_protocol import (
     YukiMessage, PROTOCOL_VERSION,
     hello_message, welcome_message, command_message,
-    command_result_message, status_message, devices_update_message
+    command_result_message, status_message, devices_update_message,
+    confirm_command_message
 )
 import logger
 from device import Device
 
+# Глобальное состояние
 connected_devices = {}
 webui_clients = set()
 lock = asyncio.Lock()
 
-HEARTBEAT_INTERVAL = 30   # секунд
-HEARTBEAT_TIMEOUT = 10    # секунд ожидания pong
+HEARTBEAT_INTERVAL = 30
+HEARTBEAT_TIMEOUT = 10
 
+# Аутентификация: токен из переменной окружения или файла .token
+AUTH_TOKEN = os.environ.get("YUKI_AUTH_TOKEN")
+if not AUTH_TOKEN:
+    token_file = os.path.join(os.path.dirname(__file__), ".token")
+    if os.path.exists(token_file):
+        with open(token_file, "r") as f:
+            AUTH_TOKEN = f.read().strip()
+if AUTH_TOKEN:
+    logger.info("Authentication enabled (token required)")
+else:
+    logger.warn("Authentication disabled – set YUKI_AUTH_TOKEN or create .token file")
 
-async def handle_device(websocket):
+# Список опасных команд, требующих подтверждения
+DANGEROUS_COMMANDS = {"shutdown", "restart", "sleep", "hibernate", "lock"}
+
+async def handle_device(websocket, path):
     device_id = None
     try:
         raw_init = await asyncio.wait_for(websocket.recv(), timeout=5.0)
@@ -40,14 +55,23 @@ async def handle_device(websocket):
 
         device_id = init_msg.payload.get("device_id")
         device_type = init_msg.payload.get("device_type")
+        capabilities = init_msg.payload.get("capabilities", [])
+        auth_token = init_msg.payload.get("auth_token")
+
         if not device_id or not device_type:
             await websocket.close(1003, "Missing device_id or device_type")
             return
 
-        device = Device(device_id, device_type, websocket)
+        # Проверка аутентификации
+        if AUTH_TOKEN and auth_token != AUTH_TOKEN:
+            logger.warn(f"Device {device_id} rejected: invalid auth token")
+            await websocket.close(1008, "Invalid authentication token")
+            return
+
+        device = Device(device_id, device_type, websocket, capabilities)
         async with lock:
             connected_devices[device_id] = device
-        logger.info(f"Device connected: {device_id} ({device_type})")
+        logger.info(f"Device connected: {device_id} ({device_type}) capabilities: {capabilities}")
 
         welcome = welcome_message(
             session_id=str(uuid.uuid4()),
@@ -130,7 +154,7 @@ async def heartbeat_monitor(device: Device):
         logger.error(f"Heartbeat monitor error for {device.id}: {e}")
 
 
-async def handle_webui(websocket):
+async def handle_webui(websocket, path):
     async with lock:
         webui_clients.add(websocket)
     try:
@@ -139,21 +163,35 @@ async def handle_webui(websocket):
         async for message in websocket:
             try:
                 data = json.loads(message)
-                if "command" in data and "device_id" in data:
+                msg_type = data.get("type")
+
+                if msg_type == "command":
                     device_id = data["device_id"]
                     cmd = data["command"]
                     payload = data.get("payload", {})
-                    async with lock:
-                        device = connected_devices.get(device_id)
-                    if device:
-                        cmd_msg = command_message(device_id, cmd, payload)
-                        success = await device.send_json(cmd_msg.to_json())
-                        if success:
-                            logger.info(f"Command sent to {device_id}: {cmd}")
-                        else:
-                            logger.error(f"Failed to send command to {device_id}")
+
+                    # Проверка на опасную команду
+                    if cmd in DANGEROUS_COMMANDS:
+                        # Отправляем запрос подтверждения в WebUI
+                        confirm_msg = confirm_command_message(device_id, cmd, payload)
+                        await websocket.send(confirm_msg.to_json())
+                        continue
+
+                    await execute_command(device_id, cmd, payload)
+
+                elif msg_type == "confirm_response":
+                    original_id = data.get("id")
+                    approved = data.get("approved", False)
+                    # Здесь нужно найти ожидающую подтверждения команду (упрощённо: передаём original_id в payload)
+                    # В реальной реализации нужно хранить карту запросов, но для простоты считаем, что
+                    # confirm_response содержит device_id, command, params
+                    device_id = data.get("device_id")
+                    cmd = data.get("command")
+                    params = data.get("params", {})
+                    if approved:
+                        await execute_command(device_id, cmd, params)
                     else:
-                        logger.warn(f"Command to unknown device {device_id}")
+                        logger.info(f"Command {cmd} for {device_id} rejected by user")
             except json.JSONDecodeError:
                 logger.warn("Invalid JSON from WebUI")
     except websockets.exceptions.ConnectionClosed:
@@ -165,11 +203,29 @@ async def handle_webui(websocket):
             webui_clients.discard(websocket)
 
 
+async def execute_command(device_id: str, cmd: str, payload: dict):
+    async with lock:
+        device = connected_devices.get(device_id)
+    if device:
+        cmd_msg = command_message(device_id, cmd, payload)
+        success = await device.send_json(cmd_msg.to_json())
+        if success:
+            logger.info(f"Command sent to {device_id}: {cmd}")
+        else:
+            logger.error(f"Failed to send command to {device_id}")
+    else:
+        logger.warn(f"Command to unknown device {device_id}")
+
+
 async def send_devices_to_webui(ws):
-    devices_info = {
-        d.id: {"type": d.type, "status": d.status}
-        for d in connected_devices.values()
-    }
+    devices_info = {}
+    for d in connected_devices.values():
+        devices_info[d.id] = {
+            "type": d.type,
+            "status": d.status,
+            "capabilities": d.capabilities,
+            "last_seen": d.last_seen
+        }
     msg = devices_update_message(devices_info)
     await ws.send(msg.to_json())
 
@@ -177,13 +233,16 @@ async def send_devices_to_webui(ws):
 async def notify_webui():
     if not webui_clients:
         return
-    devices_info = {
-        d.id: {"type": d.type, "status": d.status}
-        for d in connected_devices.values()
-    }
+    devices_info = {}
+    for d in connected_devices.values():
+        devices_info[d.id] = {
+            "type": d.type,
+            "status": d.status,
+            "capabilities": d.capabilities,
+            "last_seen": d.last_seen
+        }
     msg = devices_update_message(devices_info)
     json_msg = msg.to_json()
-    # Используем asyncio.gather с return_exceptions=True, чтобы одна ошибка не сломала остальные
     await asyncio.gather(
         *[ws.send(json_msg) for ws in webui_clients],
         return_exceptions=True
@@ -191,13 +250,12 @@ async def notify_webui():
 
 
 async def main():
-    # Новый API websockets (начиная с версии 12.0): обработчик принимает только websocket
     async def router(websocket):
         path = websocket.request.path if hasattr(websocket, 'request') else websocket.path
         if path == "/device":
-            await handle_device(websocket)
+            await handle_device(websocket, path)
         elif path == "/webui":
-            await handle_webui(websocket)
+            await handle_webui(websocket, path)
         else:
             await websocket.close(1008, "Invalid path")
 
