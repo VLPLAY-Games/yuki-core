@@ -428,6 +428,13 @@ async def device_receive_loop(device: Device, rate_limiter: RateLimiter):
                 logger.info(f"Event from {device.id}: {msg.payload}")
             elif msg.type == "command_result":
                 logger.info(f"Command result from {device.id}: success={msg.payload.get('success')}")
+                # Пересылаем результат в WebUI
+                await broadcast_to_webui(json.dumps({
+                    "type": "command_result",
+                    "device_id": device.id,
+                    "id": msg.id,
+                    "payload": msg.payload
+                }))
             else:
                 logger.warn(f"Unhandled message type '{msg.type}' from {device.id}")
     except websockets.exceptions.ConnectionClosed:
@@ -526,9 +533,29 @@ async def handle_webui(websocket, path=None):
                     device_id = data.get("device_id")
                     async with lock:
                         device = connected_devices.get(device_id)
-                    if device:
+                    if device and device.ws:
+                        # Отправляем устройству сообщение о намеренном отключении
+                        try:
+                            await device.ws.send(json.dumps({"type": "disconnect", "reason": "admin"}))
+                        except:
+                            pass
                         await device.ws.close(1000, "Disconnected by admin")
                         logger.info(f"Device {device_id} disconnected by admin")
+                    await notify_webui()
+                elif msg_type == "reconnect_device":
+                    device_id = data.get("device_id")
+                    async with lock:
+                        device = connected_devices.get(device_id)
+                    if device and device.ws:
+                        # Отправляем устройству запрос на переподключение
+                        try:
+                            await device.ws.send(json.dumps({"type": "reconnect"}))
+                            # Даём время на обработку, затем закрываем соединение
+                            await asyncio.sleep(0.5)
+                        except:
+                            pass
+                        await device.ws.close(1000, "Reconnect requested by admin")
+                        logger.info(f"Device {device_id} reconnect requested by admin")
                     await notify_webui()
                 elif msg_type == "remove_device":
                     device_id = data.get("device_id")
@@ -540,7 +567,11 @@ async def handle_webui(websocket, path=None):
                         if device_id in known_devices:
                             del known_devices[device_id]
                         save_known_devices()
-                    if device:
+                    if device and device.ws:
+                        try:
+                            await device.ws.send(json.dumps({"type": "disconnect", "reason": "removed"}))
+                        except:
+                            pass
                         await device.ws.close(1000, "Removed by admin")
                         logger.info(f"Device {device_id} removed from authorized and disconnected")
                     await notify_webui()
