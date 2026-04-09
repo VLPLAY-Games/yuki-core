@@ -5,6 +5,8 @@ import uuid
 import time
 import sys
 import os
+import secrets
+import string
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'yuki-protocol')))
 
@@ -25,13 +27,24 @@ lock = asyncio.Lock()
 HEARTBEAT_INTERVAL = 30
 HEARTBEAT_TIMEOUT = 10
 
-# Аутентификация: токен из переменной окружения или файла .token
 AUTH_TOKEN = os.environ.get("YUKI_AUTH_TOKEN")
 if not AUTH_TOKEN:
     token_file = os.path.join(os.path.dirname(__file__), ".token")
     if os.path.exists(token_file):
         with open(token_file, "r") as f:
             AUTH_TOKEN = f.read().strip()
+    else:
+        alphabet = string.ascii_letters + string.digits
+        AUTH_TOKEN = ''.join(secrets.choice(alphabet) for _ in range(32))
+        with open(token_file, "w") as f:
+            f.write(AUTH_TOKEN)
+        print("\n" + "="*60)
+        print("Yuki Core: Generated new authentication token")
+        print(f"   Token: {AUTH_TOKEN}")
+        print(f"   Saved to: {token_file}")
+        print("   Use this token in your devices to connect.")
+        print("="*60 + "\n")
+
 if AUTH_TOKEN:
     logger.info("Authentication enabled (token required)")
 else:
