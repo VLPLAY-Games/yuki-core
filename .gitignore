@@ -5,3 +5,4 @@ logs/
 authorized_devices.json
 .token_meta
 known_devices.json
+yuki_core.db
