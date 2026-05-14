@@ -1,17 +1,26 @@
 import datetime
 import os
+import logging
+from logging.handlers import RotatingFileHandler
 
 LOG_FOLDER = os.path.join(os.path.dirname(__file__), "logs")
 os.makedirs(LOG_FOLDER, exist_ok=True)
-LOG_FILE = os.path.join(LOG_FOLDER, datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".log")
 
-def log(level, message):
-    line = f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [{level}] {message}"
-    print(line)
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
+# Настройка ротируемого логгера
+log_file = os.path.join(LOG_FOLDER, "yuki.log")
+handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
+handler.setFormatter(logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s'))
 
-def info(msg): log("INFO", msg)
-def warn(msg): log("WARN", msg)
-def error(msg): log("ERROR", msg)
-def debug(msg): log("DEBUG", msg)
+logger = logging.getLogger("yuki")
+logger.setLevel(logging.DEBUG)
+logger.addHandler(handler)
+
+# Также выводим в консоль
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s'))
+logger.addHandler(console_handler)
+
+def info(msg): logger.info(msg)
+def warn(msg): logger.warning(msg)
+def error(msg): logger.error(msg)
+def debug(msg): logger.debug(msg)
