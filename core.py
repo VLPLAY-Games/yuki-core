@@ -531,9 +531,10 @@ async def handle_device(websocket, path=None):
     receive_task = None
     heartbeat_task = None
     connect_time = time.time()
+    rate_limiter = None
 
     try:
-        raw_init = await asyncio.wait_for(websocket.recv(), timeout=5.0)
+        raw_init = await asyncio.wait_for(websocket.recv(), timeout=10.0)
         try:
             from yuki_protocol import YukiMessage
             init_msg = YukiMessage.from_json(raw_init)
@@ -553,21 +554,37 @@ async def handle_device(websocket, path=None):
             await websocket.close(1003, "Missing device_id or device_type")
             return
 
-        # Проверка черного списка
-        if is_blacklisted(device_id):
-            logger.warn(f"Device {device_id} is blacklisted, rejecting connection")
-            await websocket.close(1008, "Device is blacklisted")
-            return
+        logger.info(f"Device {device_id} attempting to connect (type: {device_type})")
 
-        # Rate limiting проверка
+        # Rate limiting проверка - создаем ДО всех проверок
         rate_limiter = get_rate_limiter(device_id)
+        
         if not rate_limiter.allow():
-            logger.warn(f"Rate limit exceeded for device {device_id}")
+            logger.warning(f"Rate limit exceeded for device {device_id}")
             await websocket.close(1008, "Rate limit exceeded")
             return
 
-        if current_token and auth_token != current_token:
-            logger.warn(f"Device {device_id} rejected: invalid auth token")
+        # Проверка черного списка
+        if is_blacklisted(device_id):
+            logger.warning(f"Device {device_id} is blacklisted, rejecting connection")
+            await websocket.close(1008, "Device is blacklisted")
+            return
+
+        # Проверка токена
+        token_valid = (current_token is None or auth_token == current_token)
+        
+        # Проверка авторизации
+        is_authorized = device_id in authorized_devices_set
+        
+        # Если нет авторизованных устройств, автоматически авторизуем первое
+        if len(authorized_devices_set) == 0 and token_valid:
+            logger.info(f"No authorized devices exist, auto-authorizing {device_id}")
+            authorized_devices_set.add(device_id)
+            save_authorized()
+            is_authorized = True
+        
+        if not token_valid:
+            logger.warning(f"Device {device_id} rejected: invalid auth token")
             audit_log("auth_failed", device_id, "Invalid token", websocket.remote_address[0] if websocket.remote_address else None)
             await websocket.close(1008, "Invalid authentication token")
             return
@@ -580,7 +597,7 @@ async def handle_device(websocket, path=None):
                 device.type = device_type
                 device.capabilities = capabilities
             else:
-                device = Device(device_id, device_type, websocket, capabilities, authorized=False)
+                device = Device(device_id, device_type, websocket, capabilities, authorized=is_authorized)
                 known_devices[device_id] = device
 
             device.update_last_seen()
@@ -589,7 +606,52 @@ async def handle_device(websocket, path=None):
 
         audit_log("device_connected", device_id, f"Type: {device_type}", websocket.remote_address[0] if websocket.remote_address else None)
 
-        # Продолжение handshake...
+        # Если устройство НЕ авторизовано - отправляем запрос на авторизацию
+        if not is_authorized:
+            logger.info(f"Device {device_id} is not authorized, requesting approval")
+            device.status = "pending"
+            save_device_to_db(device)
+            
+            # Отправляем запрос авторизации всем WebUI
+            from yuki_protocol import device_auth_request_message
+            auth_request = device_auth_request_message(device_id, device_type, capabilities)
+            auth_request.id = str(uuid.uuid4())
+            
+            # Сохраняем событие для ожидания ответа
+            auth_event = asyncio.Event()
+            pending_auth_events[device_id] = auth_event
+            pending_devices[device_id] = device
+            
+            # Отправляем запрос всем WebUI
+            await broadcast_to_webui(auth_request.to_json())
+            
+            # Ждем ответа админа (60 секунд)
+            try:
+                await asyncio.wait_for(auth_event.wait(), timeout=AUTH_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning(f"Authorization timeout for device {device_id}")
+                await websocket.close(1008, "Authorization timeout")
+                return
+            
+            # Проверяем, авторизовано ли устройство после ожидания
+            if device_id not in authorized_devices_set:
+                logger.warning(f"Device {device_id} was not authorized")
+                await websocket.close(1008, "Device not authorized")
+                return
+            
+            logger.info(f"Device {device_id} authorized, completing handshake")
+            device.authorized = True
+            save_authorized()
+            
+            # Убираем из pending
+            pending_devices.pop(device_id, None)
+            pending_auth_events.pop(device_id, None)
+
+        # Убеждаемся, что rate_limiter существует (на случай если он как-то обнулился)
+        if rate_limiter is None:
+            rate_limiter = get_rate_limiter(device_id)
+
+        # Отправляем welcome
         from yuki_protocol import welcome_message
         welcome = welcome_message(
             session_id=str(uuid.uuid4()),
@@ -598,11 +660,12 @@ async def handle_device(websocket, path=None):
         )
         await device.ws.send(welcome.to_json())
         logger.info(f"Handshake completed for {device.id}")
+        
         device.status = "online"
         save_device_to_db(device)
-
         await notify_webui()
 
+        # Запускаем задачи
         receive_task = asyncio.create_task(device_receive_loop(device, rate_limiter, connect_time))
         heartbeat_task = asyncio.create_task(heartbeat_monitor(device))
         
@@ -614,12 +677,15 @@ async def handle_device(websocket, path=None):
             task.cancel()
             with suppress(Exception):
                 await task
+                
     except asyncio.TimeoutError:
-        logger.warn("Device handshake timeout")
-    except websockets.exceptions.ConnectionClosed:
-        logger.info(f"Device {device_id} connection closed during handshake")
+        logger.warning(f"Device {device_id} handshake timeout")
+    except websockets.exceptions.ConnectionClosed as e:
+        logger.info(f"Device {device_id} connection closed during handshake: {e}")
     except Exception as e:
         logger.error(f"Unexpected error in handle_device: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         if device_id:
             async with lock:
@@ -637,8 +703,10 @@ async def handle_device(websocket, path=None):
 async def device_receive_loop(device, rate_limiter, connect_time):
     try:
         async for message in device.ws:
+            logger.debug(f"Received from {device.id}: {message[:200] if len(message) > 200 else message}")
+            
             if not rate_limiter.allow():
-                logger.warn(f"Rate limit exceeded for device {device.id}")
+                logger.warning(f"Rate limit exceeded for device {device.id}")
                 await device.ws.close(1008, "Rate limit exceeded")
                 break
 
@@ -648,7 +716,7 @@ async def device_receive_loop(device, rate_limiter, connect_time):
                 from yuki_protocol import YukiMessage
                 msg = YukiMessage.from_json(message)
             except ValueError as e:
-                logger.warn(f"Invalid message from {device.id}: {e}")
+                logger.warning(f"Invalid message from {device.id}: {e}")
                 continue
 
             response_time = time.time() - start_time
@@ -659,7 +727,6 @@ async def device_receive_loop(device, rate_limiter, connect_time):
                     logger.info(f"Device {device.id} status changed to {new_status}")
                     save_device_to_db(device)
                     await notify_webui()
-                    # Трекинг uptime
                     save_device_metric(device.id, "status_change", 1 if new_status == "online" else 0)
             elif msg.type == "command_result":
                 success = msg.payload.get("success", False)
@@ -675,12 +742,11 @@ async def device_receive_loop(device, rate_limiter, connect_time):
             elif msg.type == "event":
                 logger.info(f"Event from {device.id}: {msg.payload}")
             elif msg.type == "pong":
-                # Игнорируем pong, heartbeat уже обработан
-                pass
+                pass  # Игнорируем pong
             else:
-                logger.warn(f"Unhandled message type '{msg.type}' from {device.id}")
-    except websockets.exceptions.ConnectionClosed:
-        logger.info(f"Connection closed by device {device.id}")
+                logger.warning(f"Unhandled message type '{msg.type}' from {device.id}")
+    except websockets.exceptions.ConnectionClosed as e:
+        logger.info(f"Connection closed by device {device.id}: {e}")
     except Exception as e:
         logger.error(f"Error in receive loop for {device.id}: {e}")
 
