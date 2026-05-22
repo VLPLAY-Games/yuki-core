@@ -212,7 +212,7 @@ device_rate_limiters = {}
 
 def get_rate_limiter(device_id):
     if device_id not in device_rate_limiters:
-        device_rate_limiters[device_id] = DeviceRateLimiter(device_id, 30)
+        device_rate_limiters[device_id] = DeviceRateLimiter(device_id, 60)
     return device_rate_limiters[device_id]
 
 # ==================== Системные метрики ====================
@@ -598,15 +598,25 @@ async def handle_device(websocket, path=None):
 
         from device import Device
         async with lock:
+            # Закрываем старое соединение если есть
+            old_device = connected_devices.get(device_id)
+            if old_device and old_device.ws and old_device.ws != websocket:
+                logger.info(f"Closing old connection for {device_id}")
+                try:
+                    await old_device.ws.close(1000, "New connection")
+                except:
+                    pass
+                old_device.mark_offline()
+                if device_id in connected_devices:
+                    del connected_devices[device_id]
+            
             if device_id in known_devices:
                 logger.info(f"Device {device_id} already in known_devices, updating")
                 device = known_devices[device_id]
-                # Сохраняем старый статус
                 old_status = device.status
                 device.ws = websocket
                 device.type = device_type
                 device.capabilities = capabilities
-                # Не меняем статус на online сразу, только после авторизации
                 logger.info(f"Device {device_id} updated: old_status={old_status}")
             else:
                 logger.info(f"Device {device_id} is new, creating")
@@ -672,23 +682,30 @@ async def handle_device(websocket, path=None):
         await device.ws.send(welcome.to_json())
         logger.info(f"Welcome sent to {device.id}")
         
+        # Проверяем, что WebSocket все еще открыт
+        if device.ws.state.name == "CLOSED":
+            logger.error(f"WebSocket closed immediately after welcome for {device.id}")
+            return
+        
         device.status = "online"
         save_device_to_db(device)
         await notify_webui()
         logger.info(f"Handshake COMPLETED for {device.id}, status set to online")
 
+        # Небольшая задержка перед запуском задач
+        await asyncio.sleep(0.1)
+
         # Запускаем задачи
         receive_task = asyncio.create_task(device_receive_loop(device, rate_limiter, connect_time))
         heartbeat_task = asyncio.create_task(heartbeat_monitor(device))
         
-        done, pending = await asyncio.wait(
-            [receive_task, heartbeat_task],
-            return_when=asyncio.FIRST_COMPLETED
-        )
-        for task in pending:
-            task.cancel()
-            with suppress(Exception):
-                await task
+        # Ждем завершения ОБЕИХ задач
+        try:
+            await asyncio.gather(receive_task, heartbeat_task)
+        except asyncio.CancelledError:
+            logger.info(f"Tasks cancelled for {device.id}")
+        except Exception as e:
+            logger.error(f"Error in tasks: {e}")
                 
     except asyncio.TimeoutError:
         logger.warning(f"Device {device_id} handshake timeout")
@@ -714,14 +731,26 @@ async def handle_device(websocket, path=None):
 
 async def device_receive_loop(device, rate_limiter, connect_time):
     try:
-        async for message in device.ws:
-            logger.debug(f"Received from {device.id}: {message[:200] if len(message) > 200 else message}")
+        # Проверяем, существует ли WebSocket
+        if not device.ws:
+            logger.error(f"Device {device.id} has no websocket in receive loop")
+            return
             
+        async for message in device.ws:
+            # Проверяем, что rate_limiter существует
+            if rate_limiter is None:
+                logger.error(f"Rate limiter is None for {device.id}, creating new")
+                rate_limiter = get_rate_limiter(device.id)
+                
             if not rate_limiter.allow():
                 logger.warning(f"Rate limit exceeded for device {device.id}")
-                await device.ws.close(1008, "Rate limit exceeded")
+                try:
+                    await device.ws.close(1008, "Rate limit exceeded")
+                except:
+                    pass
                 break
 
+            # Обработка сообщения...
             start_time = time.time()
             
             try:
@@ -735,11 +764,19 @@ async def device_receive_loop(device, rate_limiter, connect_time):
             
             if msg.type == "status":
                 new_status = msg.payload.get("status", device.status)
-                if device.update_status(new_status):
+                # Если пришел статус с details, но устройство уже online - не меняем статус
+                if new_status == "online" or (new_status != "online" and device.status == "online"):
+                    # Обновляем только last_seen
+                    device.update_last_seen()
+                    save_device_to_db(device)
+                    if new_status != "online":
+                        logger.debug(f"Device {device.id} sent status '{new_status}', keeping online")
+                elif device.update_status(new_status):
                     logger.info(f"Device {device.id} status changed to {new_status}")
                     save_device_to_db(device)
                     await notify_webui()
                     save_device_metric(device.id, "status_change", 1 if new_status == "online" else 0)
+                    
             elif msg.type == "command_result":
                 success = msg.payload.get("success", False)
                 error = msg.payload.get("error")
@@ -754,50 +791,89 @@ async def device_receive_loop(device, rate_limiter, connect_time):
             elif msg.type == "event":
                 logger.info(f"Event from {device.id}: {msg.payload}")
             elif msg.type == "pong":
-                pass  # Игнорируем pong
+                pass
             else:
                 logger.warning(f"Unhandled message type '{msg.type}' from {device.id}")
+                
     except websockets.exceptions.ConnectionClosed as e:
         logger.info(f"Connection closed by device {device.id}: {e}")
+    except asyncio.CancelledError:
+        logger.info(f"Receive loop cancelled for {device.id}")
     except Exception as e:
         logger.error(f"Error in receive loop for {device.id}: {e}")
+    finally:
+        logger.info(f"Receive loop ended for {device.id}")
 
 async def heartbeat_monitor(device):
+    consecutive_failures = 0
+    max_failures = 3
+    
     try:
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
             
-            # Проверяем, есть ли еще WebSocket
+            # Проверяем, есть ли еще WebSocket и устройство ли в connected_devices
             if not device.ws:
                 logger.warning(f"Heartbeat: device {device.id} has no websocket, stopping monitor")
                 break
             
+            # Дополнительная проверка - есть ли устройство в connected_devices
+            if device.id not in connected_devices:
+                logger.warning(f"Heartbeat: device {device.id} not in connected_devices, stopping monitor")
+                break
+            
+            # Проверяем состояние WebSocket
+            if device.ws.state.name == "CLOSED":
+                logger.warning(f"Heartbeat: WebSocket for {device.id} is closed")
+                break
+            
             try:
+                # Отправляем ping с таймаутом
                 pong_waiter = await device.ws.ping()
                 await asyncio.wait_for(pong_waiter, timeout=HEARTBEAT_TIMEOUT)
                 device.update_last_seen()
                 save_device_to_db(device)
+                consecutive_failures = 0
                 logger.debug(f"Heartbeat OK for {device.id}")
+                
             except asyncio.TimeoutError:
-                logger.warning(f"Heartbeat timeout for {device.id}")
-                if device.ws:
-                    await device.ws.close()
-                break
+                consecutive_failures += 1
+                logger.warning(f"Heartbeat timeout for {device.id} (failure {consecutive_failures}/{max_failures})")
+                if consecutive_failures >= max_failures:
+                    logger.warning(f"Heartbeat: too many failures for {device.id}, closing connection")
+                    if device.ws:
+                        try:
+                            await device.ws.close()
+                        except:
+                            pass
+                    break
+                    
             except AttributeError as e:
                 logger.error(f"Heartbeat attribute error for {device.id}: {e}")
                 break
-            except websockets.exceptions.ConnectionClosed:
-                logger.info(f"Heartbeat: connection closed for {device.id}")
+                
+            except websockets.exceptions.ConnectionClosed as e:
+                logger.info(f"Heartbeat: connection closed for {device.id}: {e}")
                 break
-    except websockets.exceptions.ConnectionClosed:
-        logger.info(f"Heartbeat monitor: connection closed for {device.id}")
+                
+            except Exception as e:
+                logger.error(f"Heartbeat unexpected error for {device.id}: {e}")
+                consecutive_failures += 1
+                if consecutive_failures >= max_failures:
+                    break
+                
+    except asyncio.CancelledError:
+        logger.info(f"Heartbeat monitor cancelled for {device.id}")
     except Exception as e:
         logger.error(f"Heartbeat monitor error for {device.id}: {e}")
     finally:
-        # Отмечаем устройство как офлайн
-        device.mark_offline()
-        save_device_to_db(device)
+        # Отмечаем устройство как офлайн только если оно еще в connected_devices
+        async with lock:
+            if device.id in connected_devices:
+                device.mark_offline()
+                save_device_to_db(device)
         await notify_webui()
+        logger.info(f"Heartbeat monitor stopped for {device.id}")
 
 async def handle_webui(websocket, path=None):
     ws_id = id(websocket)
