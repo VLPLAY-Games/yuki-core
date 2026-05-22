@@ -737,6 +737,15 @@ async def device_receive_loop(device, rate_limiter, connect_time):
             return
             
         async for message in device.ws:
+            # Пропускаем пустые или слишком короткие сообщения
+            if not message or len(message) < 10:
+                continue
+            
+            # Пропускаем сообщения без protocol (не Yuki сообщения)
+            if '"protocol"' not in message:
+                logger.debug(f"Non-Yuki message from {device.id}, skipping")
+                continue
+            
             # Проверяем, что rate_limiter существует
             if rate_limiter is None:
                 logger.error(f"Rate limiter is None for {device.id}, creating new")
@@ -750,14 +759,20 @@ async def device_receive_loop(device, rate_limiter, connect_time):
                     pass
                 break
 
-            # Обработка сообщения...
             start_time = time.time()
             
             try:
                 from yuki_protocol import YukiMessage
                 msg = YukiMessage.from_json(message)
             except ValueError as e:
-                logger.warning(f"Invalid message from {device.id}: {e}")
+                error_msg = str(e)
+                if "Unsupported protocol version" in error_msg or "Missing protocol" in error_msg:
+                    logger.debug(f"Non-Yuki message from {device.id}: {error_msg}")
+                else:
+                    logger.warning(f"Invalid message from {device.id}: {error_msg}")
+                continue
+            except Exception as e:
+                logger.warning(f"Unexpected error parsing message from {device.id}: {e}")
                 continue
 
             response_time = time.time() - start_time
@@ -793,7 +808,7 @@ async def device_receive_loop(device, rate_limiter, connect_time):
             elif msg.type == "pong":
                 pass
             else:
-                logger.warning(f"Unhandled message type '{msg.type}' from {device.id}")
+                logger.debug(f"Unhandled message type '{msg.type}' from {device.id}")
                 
     except websockets.exceptions.ConnectionClosed as e:
         logger.info(f"Connection closed by device {device.id}: {e}")
