@@ -674,6 +674,9 @@ async def device_receive_loop(device, rate_limiter, connect_time):
                 }))
             elif msg.type == "event":
                 logger.info(f"Event from {device.id}: {msg.payload}")
+            elif msg.type == "pong":
+                # Игнорируем pong, heartbeat уже обработан
+                pass
             else:
                 logger.warn(f"Unhandled message type '{msg.type}' from {device.id}")
     except websockets.exceptions.ConnectionClosed:
@@ -824,6 +827,79 @@ async def handle_webui(websocket, path=None):
                     
                 elif msg_type == "get_devices":
                     await send_devices_to_webui(websocket)
+                elif msg_type == "disconnect_device":
+                    device_id = data.get("device_id")
+                    async with lock:
+                        device = connected_devices.get(device_id)
+                    if device and device.ws:
+                        try:
+                            # Отправляем команду на отключение устройству
+                            disconnect_msg = {
+                                "protocol": "yuki/1.0",
+                                "type": "disconnect",
+                                "id": str(uuid.uuid4()),
+                                "timestamp": int(time.time()),
+                                "payload": {"reason": "admin_request"}
+                            }
+                            await device.ws.send(json.dumps(disconnect_msg))
+                            
+                            # Закрываем соединение
+                            await device.ws.close(1000, "Disconnected by admin")
+                            device.mark_offline()
+                            save_device_to_db(device)
+                            
+                            # Удаляем из connected_devices
+                            if device_id in connected_devices:
+                                del connected_devices[device_id]
+                            
+                            audit_log("device_disconnected", device_id, "Disconnected by admin via WebUI")
+                            await notify_webui()
+                            logger.info(f"Device {device_id} disconnected by admin")
+                            await websocket.send(json.dumps({"type": "disconnect_result", "success": True, "device_id": device_id}))
+                        except Exception as e:
+                            logger.error(f"Failed to disconnect device {device_id}: {e}")
+                            await websocket.send(json.dumps({"type": "disconnect_result", "success": False, "error": str(e)}))
+                    else:
+                        await websocket.send(json.dumps({"type": "disconnect_result", "success": False, "error": "Device not found or already offline"}))
+                        
+                elif msg_type == "remove_device":
+                    device_id = data.get("device_id")
+                    async with lock:
+                        # Сначала отключаем, если онлайн
+                        device = connected_devices.get(device_id)
+                        if device and device.ws:
+                            try:
+                                await device.ws.close(1000, "Device removed by admin")
+                            except:
+                                pass
+                            if device_id in connected_devices:
+                                del connected_devices[device_id]
+                        
+                        # Удаляем из known_devices
+                        if device_id in known_devices:
+                            del known_devices[device_id]
+                        
+                        # Удаляем из БД
+                        try:
+                            conn = sqlite3.connect(DB_PATH)
+                            cursor = conn.cursor()
+                            cursor.execute("DELETE FROM devices WHERE device_id = ?", (device_id,))
+                            cursor.execute("DELETE FROM authorized WHERE device_id = ?", (device_id,))
+                            cursor.execute("DELETE FROM command_history WHERE device_id = ?", (device_id,))
+                            cursor.execute("DELETE FROM device_metrics WHERE device_id = ?", (device_id,))
+                            conn.commit()
+                            conn.close()
+                        except Exception as e:
+                            logger.error(f"Failed to remove device from DB: {e}")
+                        
+                        # Удаляем из черного списка, если был
+                        remove_from_blacklist(device_id)
+                        
+                        audit_log("device_removed", device_id, "Device removed by admin via WebUI")
+                        await notify_webui()
+                        logger.info(f"Device {device_id} removed by admin")
+                        await websocket.send(json.dumps({"type": "remove_result", "success": True, "device_id": device_id}))
+
                     
             except json.JSONDecodeError:
                 logger.warn("Invalid JSON from WebUI")
