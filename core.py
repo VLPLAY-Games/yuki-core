@@ -212,7 +212,7 @@ device_rate_limiters = {}
 
 def get_rate_limiter(device_id):
     if device_id not in device_rate_limiters:
-        device_rate_limiters[device_id] = DeviceRateLimiter(device_id, 10)
+        device_rate_limiters[device_id] = DeviceRateLimiter(device_id, 30)
     return device_rate_limiters[device_id]
 
 # ==================== Системные метрики ====================
@@ -766,6 +766,12 @@ async def heartbeat_monitor(device):
     try:
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
+            
+            # Проверяем, есть ли еще WebSocket
+            if not device.ws:
+                logger.warning(f"Heartbeat: device {device.id} has no websocket, stopping monitor")
+                break
+            
             try:
                 pong_waiter = await device.ws.ping()
                 await asyncio.wait_for(pong_waiter, timeout=HEARTBEAT_TIMEOUT)
@@ -773,13 +779,25 @@ async def heartbeat_monitor(device):
                 save_device_to_db(device)
                 logger.debug(f"Heartbeat OK for {device.id}")
             except asyncio.TimeoutError:
-                logger.warn(f"Heartbeat timeout for {device.id}")
-                await device.ws.close()
+                logger.warning(f"Heartbeat timeout for {device.id}")
+                if device.ws:
+                    await device.ws.close()
+                break
+            except AttributeError as e:
+                logger.error(f"Heartbeat attribute error for {device.id}: {e}")
+                break
+            except websockets.exceptions.ConnectionClosed:
+                logger.info(f"Heartbeat: connection closed for {device.id}")
                 break
     except websockets.exceptions.ConnectionClosed:
-        pass
+        logger.info(f"Heartbeat monitor: connection closed for {device.id}")
     except Exception as e:
         logger.error(f"Heartbeat monitor error for {device.id}: {e}")
+    finally:
+        # Отмечаем устройство как офлайн
+        device.mark_offline()
+        save_device_to_db(device)
+        await notify_webui()
 
 async def handle_webui(websocket, path=None):
     ws_id = id(websocket)
