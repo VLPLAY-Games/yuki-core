@@ -16,6 +16,7 @@ from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
+from collections import defaultdict
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -345,6 +346,66 @@ HEARTBEAT_INTERVAL = 30
 HEARTBEAT_TIMEOUT = 10
 AUTH_TIMEOUT = 60
 DANGEROUS_COMMANDS = {"shutdown", "restart", "sleep", "hibernate", "lock"}
+
+extended_statuses = {}  # device_id -> {substatus, details, last_update}
+device_metrics_store = defaultdict(list)  # device_id -> list of metrics
+MAX_METRICS_HISTORY = 100  # храним последние 100 метрик
+METRICS_RETENTION_HOURS = 24  # храним метрики 24 часа
+
+# Хранилище ожидающих ответов между устройствами
+pending_device_requests = {}  # request_id -> {from_device, to_device, timestamp}
+
+def save_device_metrics(device_id: str, metrics: dict):
+    """Сохранение метрик устройства с временной меткой"""
+    timestamp = time.time()
+    metrics_entry = {
+        "timestamp": timestamp,
+        "metrics": metrics
+    }
+    device_metrics_store[device_id].append(metrics_entry)
+    
+    # Очистка старых метрик
+    cutoff = timestamp - METRICS_RETENTION_HOURS * 3600
+    device_metrics_store[device_id] = [
+        m for m in device_metrics_store[device_id] 
+        if m["timestamp"] > cutoff
+    ]
+    
+    # Ограничение по количеству
+    if len(device_metrics_store[device_id]) > MAX_METRICS_HISTORY:
+        device_metrics_store[device_id] = device_metrics_store[device_id][-MAX_METRICS_HISTORY:]
+    
+    # Сохраняем в БД
+    for key, value in metrics.items():
+        if isinstance(value, (int, float)):
+            save_device_metric(device_id, key, value)
+    
+    logger.debug(f"Saved metrics for {device_id}: {len(metrics)} metrics")
+    return metrics_entry
+
+def get_device_metrics(device_id: str, hours: int = 1, metric_names: list = None):
+    """Получение метрик устройства за последние N часов"""
+    cutoff = time.time() - hours * 3600
+    metrics = device_metrics_store.get(device_id, [])
+    filtered = [m for m in metrics if m["timestamp"] > cutoff]
+    
+    if metric_names:
+        # Фильтруем только запрошенные метрики
+        for entry in filtered:
+            entry["metrics"] = {
+                k: v for k, v in entry["metrics"].items() 
+                if k in metric_names
+            }
+    
+    return filtered
+
+def get_latest_metrics(device_id: str):
+    """Получение последних метрик устройства"""
+    metrics_list = device_metrics_store.get(device_id, [])
+    if metrics_list:
+        return metrics_list[-1]
+    return None
+
 
 # ==================== Работа с БД ====================
 def save_device_to_db(device):
@@ -807,6 +868,220 @@ async def device_receive_loop(device, rate_limiter, connect_time):
                 logger.info(f"Event from {device.id}: {msg.payload}")
             elif msg.type == "pong":
                 pass
+            elif msg.type == "extended_status":
+                # Обработка расширенного статуса
+                substatus = msg.payload.get("substatus")
+                details = msg.payload.get("details", {})
+                
+                extended_statuses[device.id] = {
+                    "substatus": substatus,
+                    "details": details,
+                    "last_update": time.time(),
+                    "main_status": device.status
+                }
+                
+                logger.info(f"Device {device.id} extended status: {substatus}")
+                
+                # Уведомляем WebUI
+                await broadcast_to_webui(json.dumps({
+                    "type": "extended_status",
+                    "device_id": device.id,
+                    "substatus": substatus,
+                    "details": details
+                }))
+                
+                # Сохраняем в БД статус-чейндж
+                if substatus:
+                    save_device_metric(device.id, f"substatus_{substatus}", 1)
+                
+            elif msg.type == "metrics":
+                # Обработка метрик
+                metrics = msg.payload.get("metrics", {})
+                timestamp = msg.payload.get("timestamp", time.time())
+                
+                save_device_metrics(device.id, metrics)
+                
+                # Уведомляем WebUI
+                await broadcast_to_webui(json.dumps({
+                    "type": "metrics_update",
+                    "device_id": device.id,
+                    "metrics": metrics,
+                    "timestamp": timestamp
+                }))
+                
+                # Логируем важные метрики
+                if metrics.get("battery") is not None and metrics.get("battery") < 20:
+                    logger.warning(f"Device {device.id} battery low: {metrics['battery']}%")
+                if metrics.get("temperature") is not None and metrics.get("temperature") > 70:
+                    logger.warning(f"Device {device.id} temperature high: {metrics['temperature']}°C")
+                
+            elif msg.type == "metrics_request":
+                # Запрос метрик - отправляем последние
+                latest = get_latest_metrics(device.id)
+                if latest:
+                    response = {
+                        "protocol": "yuki/1.1",
+                        "type": "metrics",
+                        "id": str(uuid.uuid4()),
+                        "timestamp": int(time.time()),
+                        "payload": {
+                            "device_id": device.id,
+                            "metrics": latest["metrics"],
+                            "timestamp": latest["timestamp"]
+                        }
+                    }
+                    await device.send_json(json.dumps(response))
+                
+            elif msg.type == "device_to_device":
+                # Прямая отправка от устройства к устройству
+                from_device_id = msg.payload.get("from_device_id")
+                to_device_id = msg.payload.get("to_device_id")
+                command = msg.payload.get("command")
+                payload = msg.payload.get("payload", {})
+                require_response = msg.payload.get("require_response", False)
+                
+                # Проверяем, что отправитель соответствует текущему устройству
+                if from_device_id != device.id:
+                    logger.warning(f"Device {device.id} attempted to spoof from_device_id={from_device_id}")
+                    await device.send_json(json.dumps({
+                        "type": "error",
+                        "payload": {"error": "Invalid from_device_id"}
+                    }))
+                    continue
+                
+                async with lock:
+                    target_device = connected_devices.get(to_device_id)
+                
+                if not target_device or target_device.status != "online":
+                    error_msg = {
+                        "type": "error",
+                        "id": msg.id,
+                        "payload": {"error": f"Device {to_device_id} is offline or not found"}
+                    }
+                    await device.send_json(json.dumps(error_msg))
+                    continue
+                
+                # Формируем сообщение для целевого устройства
+                forward_msg = {
+                    "protocol": "yuki/1.1",
+                    "type": "device_command",
+                    "id": msg.id,
+                    "timestamp": int(time.time()),
+                    "payload": {
+                        "from_device_id": from_device_id,
+                        "command": command,
+                        "payload": payload,
+                        "require_response": require_response
+                    }
+                }
+                
+                success = await target_device.send_json(json.dumps(forward_msg))
+                
+                if success:
+                    logger.info(f"Device {from_device_id} -> {to_device_id}: {command}")
+                    audit_log("device_to_device", from_device_id, f"Sent to {to_device_id}: {command}")
+                    
+                    # Если требуется ответ, сохраняем запрос
+                    if require_response:
+                        pending_device_requests[msg.id] = {
+                            "from_device": from_device_id,
+                            "to_device": to_device_id,
+                            "timestamp": time.time(),
+                            "command": command
+                        }
+                        
+                        # Таймаут для ответа
+                        asyncio.create_task(await_device_response(msg.id, device, to_device_id))
+                else:
+                    await device.send_json(json.dumps({
+                        "type": "error",
+                        "id": msg.id,
+                        "payload": {"error": f"Failed to send to {to_device_id}"}
+                    }))
+                
+            elif msg.type == "device_response":
+                # Ответ от устройства на запрос от другого устройства
+                original_id = msg.id
+                success = msg.payload.get("success", False)
+                result = msg.payload.get("result")
+                error = msg.payload.get("error")
+                
+                # Находим ожидающий запрос
+                if original_id in pending_device_requests:
+                    req = pending_device_requests[original_id]
+                    from_device_id = req["from_device"]
+                    
+                    async with lock:
+                        original_device = connected_devices.get(from_device_id)
+                    
+                    if original_device and original_device.status == "online":
+                        response_msg = {
+                            "protocol": "yuki/1.1",
+                            "type": "device_response",
+                            "id": original_id,
+                            "timestamp": int(time.time()),
+                            "payload": {
+                                "from_device_id": device.id,
+                                "success": success,
+                                "result": result,
+                                "error": error
+                            }
+                        }
+                        await original_device.send_json(json.dumps(response_msg))
+                    
+                    del pending_device_requests[original_id]
+                    logger.info(f"Device response forwarded: {original_id} success={success}")
+                
+            elif msg.type == "device_broadcast":
+                # Широковещательная команда от устройства
+                from_device_id = msg.payload.get("from_device_id")
+                command = msg.payload.get("command")
+                payload = msg.payload.get("payload", {})
+                device_filter = msg.payload.get("device_filter")
+                
+                if from_device_id != device.id:
+                    logger.warning(f"Device {device.id} attempted to spoof broadcast from_device_id")
+                    continue
+                
+                async with lock:
+                    devices_to_send = []
+                    for dev_id, dev in connected_devices.items():
+                        if dev_id == device.id:
+                            continue
+                        if device_filter and dev_id not in device_filter:
+                            continue
+                        if dev.status == "online":
+                            devices_to_send.append(dev)
+                
+                sent_count = 0
+                for target_device in devices_to_send:
+                    broadcast_msg = {
+                        "protocol": "yuki/1.1",
+                        "type": "device_broadcast",
+                        "id": str(uuid.uuid4()),
+                        "timestamp": int(time.time()),
+                        "payload": {
+                            "from_device_id": from_device_id,
+                            "command": command,
+                            "payload": payload
+                        }
+                    }
+                    if await target_device.send_json(json.dumps(broadcast_msg)):
+                        sent_count += 1
+                    await asyncio.sleep(0.05)
+                
+                # Отправляем отправителю отчет о доставке
+                await device.send_json(json.dumps({
+                    "type": "broadcast_report",
+                    "payload": {
+                        "sent_to": sent_count,
+                        "total": len(devices_to_send),
+                        "command": command
+                    }
+                }))
+                
+                logger.info(f"Device {from_device_id} broadcast '{command}' to {sent_count} devices")
+
             else:
                 logger.debug(f"Unhandled message type '{msg.type}' from {device.id}")
                 
@@ -818,6 +1093,23 @@ async def device_receive_loop(device, rate_limiter, connect_time):
         logger.error(f"Error in receive loop for {device.id}: {e}")
     finally:
         logger.info(f"Receive loop ended for {device.id}")
+
+async def await_device_response(request_id: str, from_device, to_device_id: str):
+    """Ожидание ответа от устройства с таймаутом"""
+    await asyncio.sleep(30)  # 30 секунд таймаут
+    if request_id in pending_device_requests:
+        req = pending_device_requests[request_id]
+        if req["to_device"] == to_device_id:
+            # Таймаут - отправляем ошибку
+            timeout_msg = {
+                "type": "error",
+                "id": request_id,
+                "payload": {"error": "Response timeout"}
+            }
+            await from_device.send_json(json.dumps(timeout_msg))
+            del pending_device_requests[request_id]
+            logger.warning(f"Device response timeout for {request_id}")
+
 
 async def heartbeat_monitor(device):
     consecutive_failures = 0
@@ -1014,6 +1306,47 @@ async def handle_webui(websocket, path=None):
                     
                 elif msg_type == "get_devices":
                     await send_devices_to_webui(websocket)
+                elif msg_type == "get_device_metrics":
+                    device_id = data.get("device_id")
+                    hours = data.get("hours", 1)
+                    metric_names = data.get("metrics")
+                    metrics = get_device_metrics(device_id, hours, metric_names)
+                    await websocket.send(json.dumps({
+                        "type": "device_metrics",
+                        "device_id": device_id,
+                        "metrics": metrics
+                    }))
+
+                elif msg_type == "get_extended_statuses":
+                    await websocket.send(json.dumps({
+                        "type": "extended_statuses",
+                        "statuses": extended_statuses
+                    }))
+
+                elif msg_type == "request_device_metrics":
+                    device_id = data.get("device_id")
+                    metric_types = data.get("metric_types")
+                    
+                    async with lock:
+                        device = connected_devices.get(device_id)
+                    
+                    if device and device.status == "online":
+                        from yuki_protocol import metrics_request_message
+                        req = metrics_request_message(device_id, metric_types)
+                        await device.send_json(req.to_json())
+                        await websocket.send(json.dumps({
+                            "type": "metrics_requested",
+                            "device_id": device_id,
+                            "success": True
+                        }))
+                    else:
+                        await websocket.send(json.dumps({
+                            "type": "metrics_requested",
+                            "device_id": device_id,
+                            "success": False,
+                            "error": "Device offline"
+                        }))
+
                 elif msg_type == "disconnect_device":
                     device_id = data.get("device_id")
                     async with lock:
@@ -1211,9 +1544,11 @@ async def send_devices_to_webui(ws):
             devices_info[d.id] = {
                 "type": d.type,
                 "status": d.status,
+                "substatus": extended_statuses.get(d.id, {}).get("substatus"),
                 "capabilities": d.capabilities,
                 "authorized": d.authorized,
-                "last_seen": d.last_seen
+                "last_seen": d.last_seen,
+                "last_metrics": get_latest_metrics(d.id)
             }
     from yuki_protocol import devices_update_message
     msg = devices_update_message(devices_info)
@@ -1234,9 +1569,11 @@ async def notify_webui():
         devices_info[d.id] = {
             "type": d.type,
             "status": d.status,
+            "substatus": extended_statuses.get(d.id, {}).get("substatus"),
             "capabilities": d.capabilities,
             "authorized": d.authorized,
-            "last_seen": d.last_seen
+            "last_seen": d.last_seen,
+            "last_metrics": get_latest_metrics(d.id)
         }
     from yuki_protocol import devices_update_message
     msg = devices_update_message(devices_info)
