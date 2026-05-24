@@ -13,6 +13,7 @@ class Device:
         self.last_seen = time.time()
         self.command_count = 0  # Счетчик команд
         self.last_command_time = 0
+        self.last_metrics = {}
 
     def update_status(self, new_status):
         if new_status != self.status:

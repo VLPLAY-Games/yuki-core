@@ -877,7 +877,6 @@ async def device_receive_loop(device, rate_limiter, connect_time):
                     "substatus": substatus,
                     "details": details,
                     "last_update": time.time(),
-                    "main_status": device.status
                 }
                 
                 logger.info(f"Device {device.id} extended status: {substatus}")
@@ -901,7 +900,16 @@ async def device_receive_loop(device, rate_limiter, connect_time):
                 
                 save_device_metrics(device.id, metrics)
                 
-                # Уведомляем WebUI
+                # Обновляем last_metrics в устройстве для отправки в devices_update
+                if hasattr(device, 'last_metrics'):
+                    device.last_metrics = metrics
+                else:
+                    device.last_metrics = metrics
+                
+                # Отправляем обновление устройств в WebUI (включая метрики)
+                await notify_webui()
+                
+                # Дополнительно отправляем событие обновления метрик
                 await broadcast_to_webui(json.dumps({
                     "type": "metrics_update",
                     "device_id": device.id,
@@ -1548,7 +1556,7 @@ async def send_devices_to_webui(ws):
                 "capabilities": d.capabilities,
                 "authorized": d.authorized,
                 "last_seen": d.last_seen,
-                "last_metrics": get_latest_metrics(d.id)
+                "last_metrics": getattr(d, 'last_metrics', None) or get_latest_metrics(d.id)
             }
     from yuki_protocol import devices_update_message
     msg = devices_update_message(devices_info)
@@ -1573,7 +1581,7 @@ async def notify_webui():
             "capabilities": d.capabilities,
             "authorized": d.authorized,
             "last_seen": d.last_seen,
-            "last_metrics": get_latest_metrics(d.id)
+            "last_metrics": getattr(d, 'last_metrics', None) or get_latest_metrics(d.id)
         }
     from yuki_protocol import devices_update_message
     msg = devices_update_message(devices_info)
