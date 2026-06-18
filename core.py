@@ -24,7 +24,9 @@ logger = logging.getLogger("yuki-core")
 
 # ==================== SQLite БД ====================
 DB_PATH = os.path.join(os.path.dirname(__file__), "yuki_core.db")
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'yuki-protocol')))
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+PROTOCOL_PATH = os.path.join(PROJECT_ROOT, 'libs', 'yuki-protocol', 'python')
+sys.path.insert(0, PROTOCOL_PATH)
 
 def init_db():
     """Инициализация базы данных SQLite"""
