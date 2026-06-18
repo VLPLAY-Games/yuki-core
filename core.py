@@ -1206,10 +1206,22 @@ async def handle_webui(websocket, path=None):
                 msg_type = data.get("type")
                 
                 if msg_type == "command":
-                    device_id = data["device_id"]
-                    cmd = data["command"]
-                    payload = data.get("payload", {})
-                    cmd_id = data.get("id")
+                    # Поддержка обоих форматов
+                    if "device_id" in data:
+                        # Старый формат (прямые поля)
+                        device_id = data["device_id"]
+                        cmd = data["command"]
+                        payload = data.get("payload", {})
+                        cmd_id = data.get("id")
+                    elif "payload" in data and "device_id" in data["payload"]:
+                        # Новый формат (с payload)
+                        device_id = data["payload"]["device_id"]
+                        cmd = data["payload"]["command"]
+                        payload = data["payload"].get("params", {})
+                        cmd_id = data.get("id")
+                    else:
+                        logger.warning(f"Invalid command format: {data}")
+                        continue
                     
                     # Rate limiting проверка
                     rate_limiter = get_rate_limiter(device_id)
