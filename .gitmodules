@@ -1,0 +1,3 @@
+[submodule "libs/yuki-protocol"]
+	path = libs/yuki-protocol
+	url = https://github.com/VLPLAY-Games/yuki-protocol
