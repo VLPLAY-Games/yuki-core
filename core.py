@@ -646,12 +646,12 @@ async def handle_device(websocket, path=None):
         is_authorized = device_id in authorized_devices_set
         logger.info(f"Device {device_id} authorized in DB: {is_authorized}")
         
-        # Если нет авторизованных устройств, автоматически авторизуем первое
-        if len(authorized_devices_set) == 0 and token_valid:
-            logger.info(f"No authorized devices exist, auto-authorizing {device_id}")
-            authorized_devices_set.add(device_id)
-            save_authorized()
-            is_authorized = True
+        # # Если нет авторизованных устройств, автоматически авторизуем первое
+        # if len(authorized_devices_set) == 0 and token_valid:
+        #     logger.info(f"No authorized devices exist, auto-authorizing {device_id}")
+        #     authorized_devices_set.add(device_id)
+        #     save_authorized()
+        #     is_authorized = True
         
         if not token_valid:
             logger.warning(f"Device {device_id} rejected: invalid auth token")
@@ -1289,8 +1289,9 @@ async def handle_webui(websocket, path=None):
                         pending_confirm_commands.pop(confirm_id, None)
                         
                 elif msg_type == "device_auth_response":
-                    device_id = data.get("device_id")
-                    approved = data.get("approved", False)
+                    payload = data.get("payload", {})
+                    device_id = payload.get("device_id")
+                    approved = payload.get("approved", False)
                     async with lock:
                         device = pending_devices.get(device_id) or known_devices.get(device_id)
                         auth_event = pending_auth_events.get(device_id)
