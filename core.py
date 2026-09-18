@@ -613,20 +613,36 @@ async def handle_device(websocket, path=None):
     connect_time = time.time()
     rate_limiter = None
 
+    logger.info("handle_device: entered")
+
     try:
         raw_init = await asyncio.wait_for(websocket.recv(), timeout=10.0)
-        logger.info(f"Received initial message: {redact_tokens(raw_init)[:200] if raw_init else 'empty'}")
-        
+        logger.info(
+            f"Received initial message: "
+            f"{redact_tokens(raw_init)[:200] if raw_init else 'empty'}"
+        )
+
         try:
             from yuki_protocol import YukiMessage
+
             init_msg = YukiMessage.from_json(raw_init)
+
             if init_msg.type != "hello":
-                logger.warning(f"First message is not hello: {init_msg.type}")
-                await websocket.close(1003, "First message must be 'hello'")
+                logger.warning(
+                    f"First message is not hello: {init_msg.type}"
+                )
+                await websocket.close(
+                    1003,
+                    "First message must be 'hello'"
+                )
                 return
+
         except ValueError as e:
             logger.error(f"Invalid protocol message: {e}")
-            await websocket.close(1003, f"Invalid protocol: {e}")
+            await websocket.close(
+                1003,
+                f"Invalid protocol: {e}"
+            )
             return
 
         device_id = init_msg.payload.get("device_id")
@@ -635,181 +651,545 @@ async def handle_device(websocket, path=None):
         auth_token = init_msg.payload.get("auth_token")
 
         if not device_id or not device_type:
-            logger.warning(f"Missing device_id or device_type: device_id={device_id}, device_type={device_type}")
-            await websocket.close(1003, "Missing device_id or device_type")
+            logger.warning(
+                f"Missing device_id or device_type: "
+                f"device_id={device_id}, device_type={device_type}"
+            )
+            await websocket.close(
+                1003,
+                "Missing device_id or device_type"
+            )
             return
 
-        logger.info(f"Device {device_id} attempting to connect (type: {device_type})")
+        logger.info(
+            f"Device {device_id} attempting to connect "
+            f"(type: {device_type})"
+        )
 
-        # Rate limiting проверка
         rate_limiter = get_rate_limiter(device_id)
-        
+
         if not rate_limiter.allow():
-            logger.warning(f"Rate limit exceeded for device {device_id}")
-            await websocket.close(1008, "Rate limit exceeded")
+            logger.warning(
+                f"Rate limit exceeded for device {device_id}"
+            )
+            await websocket.close(
+                1008,
+                "Rate limit exceeded"
+            )
             return
 
-        # Проверка черного списка
         if is_blacklisted(device_id):
-            logger.warning(f"Device {device_id} is blacklisted, rejecting connection")
-            await websocket.close(1008, "Device is blacklisted")
+            logger.warning(
+                f"Device {device_id} is blacklisted, rejecting connection"
+            )
+            await websocket.close(
+                1008,
+                "Device is blacklisted"
+            )
             return
 
-        # Проверка токена
-        token_valid = (current_token is None or (auth_token is not None and hmac.compare_digest(auth_token, current_token)))
-        logger.info(f"Token validation: token_valid={token_valid}, has_token={bool(current_token)}")
-        
-        # Проверка авторизации
-        is_authorized = device_id in authorized_devices_set
-        logger.info(f"Device {device_id} authorized in DB: {is_authorized}")
-        
-        # # Если нет авторизованных устройств, автоматически авторизуем первое
-        # if len(authorized_devices_set) == 0 and token_valid:
-        #     logger.info(f"No authorized devices exist, auto-authorizing {device_id}")
-        #     authorized_devices_set.add(device_id)
-        #     save_authorized()
-        #     is_authorized = True
-        
+        token_valid = (
+            current_token is None
+            or (
+                auth_token is not None
+                and hmac.compare_digest(auth_token, current_token)
+            )
+        )
+
+        logger.info(
+            f"Token validation: "
+            f"token_valid={token_valid}, "
+            f"has_token={bool(current_token)}"
+        )
+
         if not token_valid:
-            logger.warning(f"Device {device_id} rejected: invalid auth token")
-            audit_log("auth_failed", device_id, "Invalid token", websocket.remote_address[0] if websocket.remote_address else None)
-            await websocket.close(1008, "Invalid authentication token")
+            logger.warning(
+                f"Device {device_id} rejected: invalid auth token"
+            )
+
+            audit_log(
+                "auth_failed",
+                device_id,
+                "Invalid token",
+                websocket.remote_address[0]
+                if websocket.remote_address
+                else None
+            )
+
+            await websocket.close(
+                1008,
+                "Invalid authentication token"
+            )
             return
 
-        from device import Device
+        is_authorized = device_id in authorized_devices_set
+
+        logger.info(
+            f"Device {device_id} authorized in DB: {is_authorized}"
+        )
+
+        logger.info(
+            f"Importing Device class for {device_id}..."
+        )
+
+        try:
+            from device import Device
+        except Exception as e:
+            logger.exception(
+                f"Failed to import Device class: {e}"
+            )
+            await websocket.close(
+                1011,
+                "Server misconfiguration"
+            )
+            return
+
+        logger.info(
+            f"Device class imported OK for {device_id}"
+        )
+
+        # --------------------------------------------------------
+        # Создание/обновление устройства
+        #
+        # ВАЖНО:
+        # Никаких await внутри lock.
+        # Старое websocket закрывается ПОСЛЕ выхода из lock.
+        # --------------------------------------------------------
+
+        old_device = None
+        old_websocket = None
+
+        logger.info(
+            f"Entering lock block for {device_id}..."
+        )
+
         async with lock:
-            # Закрываем старое соединение если есть
             old_device = connected_devices.get(device_id)
-            if old_device and old_device.ws and old_device.ws != websocket:
-                logger.info(f"Closing old connection for {device_id}")
-                try:
-                    # Bounded: an unresponsive stale connection must never hold up `lock` (and
-                    # therefore every other device/webui connection) indefinitely.
-                    await asyncio.wait_for(old_device.ws.close(1000, "New connection"), timeout=5)
-                except Exception:
-                    pass
-                old_device.mark_offline()
-                if device_id in connected_devices:
-                    del connected_devices[device_id]
-            
-            if device_id in known_devices:
-                logger.info(f"Device {device_id} already in known_devices, updating")
-                device = known_devices[device_id]
-                old_status = device.status
-                device.ws = websocket
-                device.type = device_type
-                device.capabilities = capabilities
-                logger.info(f"Device {device_id} updated: old_status={old_status}")
-            else:
-                logger.info(f"Device {device_id} is new, creating")
-                device = Device(device_id, device_type, websocket, capabilities, authorized=is_authorized)
-                known_devices[device_id] = device
+
+            if (
+                old_device
+                and old_device.ws
+                and old_device.ws is not websocket
+            ):
+                old_websocket = old_device.ws
+
+                logger.info(
+                    f"Replacing old connection for {device_id}"
+                )
+
+                # Сразу убираем старое соединение из активных.
+                connected_devices.pop(device_id, None)
+
+            # Всегда создаём новый Device-объект для нового websocket.
+            #
+            # Это важно: старый handle_device() больше не сможет
+            # случайно пометить новую сессию offline.
+
+            try:
+                device = Device(
+                    device_id,
+                    device_type,
+                    websocket,
+                    capabilities,
+                    authorized=is_authorized
+                )
+            except Exception as e:
+                logger.exception(
+                    f"Failed to construct Device for {device_id}: {e}"
+                )
+                raise
+
+            known_devices[device_id] = device
 
             device.update_last_seen()
+
             connected_devices[device_id] = device
+
             save_device_to_db(device)
 
-        audit_log("device_connected", device_id, f"Type: {device_type}", websocket.remote_address[0] if websocket.remote_address else None)
+        logger.info(
+            f"Exited lock block for {device_id}, device={device}"
+        )
 
-        # Если устройство НЕ авторизовано - отправляем запрос на авторизацию
+        # --------------------------------------------------------
+        # Закрываем старый websocket ВНЕ lock.
+        # --------------------------------------------------------
+
+        if old_websocket is not None:
+            try:
+                await asyncio.wait_for(
+                    old_websocket.close(
+                        1000,
+                        "New connection"
+                    ),
+                    timeout=5
+                )
+            except Exception as e:
+                logger.debug(
+                    f"Old connection for {device_id} "
+                    f"already closed: {e}"
+                )
+
+        audit_log(
+            "device_connected",
+            device_id,
+            f"Type: {device_type}",
+            websocket.remote_address[0]
+            if websocket.remote_address
+            else None
+        )
+
+        # --------------------------------------------------------
+        # Авторизация
+        # --------------------------------------------------------
+
         if not is_authorized:
-            logger.info(f"Device {device_id} is NOT authorized, requesting approval")
+            logger.info(
+                f"Device {device_id} is NOT authorized, "
+                f"requesting approval"
+            )
+
             device.status = "pending"
             save_device_to_db(device)
-            
-            from yuki_protocol import device_auth_request_message
-            auth_request = device_auth_request_message(device_id, device_type, capabilities)
-            auth_request.id = str(uuid.uuid4())
-            
-            auth_event = asyncio.Event()
-            pending_auth_events[device_id] = auth_event
-            pending_devices[device_id] = device
-            
-            await broadcast_to_webui(auth_request.to_json())
-            logger.info(f"Auth request sent for {device_id}, waiting for response...")
-            
-            try:
-                await asyncio.wait_for(auth_event.wait(), timeout=AUTH_TIMEOUT)
-                logger.info(f"Auth response received for {device_id}")
-            except asyncio.TimeoutError:
-                logger.warning(f"Authorization timeout for device {device_id}")
-                await websocket.close(1008, "Authorization timeout")
-                return
-            
-            if device_id not in authorized_devices_set:
-                logger.warning(f"Device {device_id} was not authorized by admin")
-                await websocket.close(1008, "Device not authorized")
-                return
-            
-            logger.info(f"Device {device_id} authorized, continuing handshake")
-            device.authorized = True
-            save_authorized()
-            
-            pending_devices.pop(device_id, None)
-            pending_auth_events.pop(device_id, None)
-        else:
-            logger.info(f"Device {device_id} is already authorized")
 
-        # Убеждаемся, что rate_limiter существует
+            try:
+                from yuki_protocol import device_auth_request_message
+            except Exception as e:
+                logger.exception(
+                    f"Cannot import device_auth_request_message: {e}"
+                )
+
+                await websocket.close(
+                    1011,
+                    "Server misconfiguration: protocol helper missing"
+                )
+                return
+
+            try:
+                auth_request = device_auth_request_message(
+                    device_id,
+                    device_type,
+                    capabilities
+                )
+
+                auth_request.id = str(uuid.uuid4())
+
+                logger.info(
+                    f"Built auth_request for {device_id}, "
+                    f"id={auth_request.id}"
+                )
+
+            except Exception as e:
+                logger.exception(
+                    f"device_auth_request_message() failed "
+                    f"for {device_id}: {e}"
+                )
+
+                await websocket.close(
+                    1011,
+                    "Failed to build auth request"
+                )
+                return
+
+            auth_event = asyncio.Event()
+
+            async with lock:
+                pending_auth_events[device_id] = auth_event
+                pending_devices[device_id] = device
+
+                webui_count = len(webui_clients)
+
+            logger.info(
+                f"Broadcasting auth request to "
+                f"{webui_count} WebUI client(s)"
+            )
+
+            if webui_count == 0:
+                logger.warning(
+                    f"No WebUI clients connected - "
+                    f"auth request for {device_id} will time out "
+                    f"in {AUTH_TIMEOUT}s. Open the WebUI to approve."
+                )
+
+            # ВАЖНО:
+            # broadcast_to_webui() сам использует lock,
+            # поэтому вызываем его только вне lock.
+
+            try:
+                await broadcast_to_webui(
+                    auth_request.to_json()
+                )
+
+                logger.info(
+                    f"Auth request sent for {device_id}, "
+                    f"waiting for response..."
+                )
+
+            except Exception as e:
+                logger.exception(
+                    f"broadcast_to_webui failed for "
+                    f"{device_id}: {e}"
+                )
+
+                async with lock:
+                    pending_devices.pop(device_id, None)
+                    pending_auth_events.pop(device_id, None)
+
+                await websocket.close(
+                    1011,
+                    "Failed to notify WebUI"
+                )
+                return
+
+            # ----------------------------------------------------
+            # Ждём ответа WebUI
+            # ----------------------------------------------------
+
+            try:
+                await asyncio.wait_for(
+                    auth_event.wait(),
+                    timeout=AUTH_TIMEOUT
+                )
+
+                logger.info(
+                    f"Auth response received for {device_id}"
+                )
+
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"Authorization timeout for device {device_id}"
+                )
+
+                async with lock:
+                    pending_devices.pop(device_id, None)
+                    pending_auth_events.pop(device_id, None)
+
+                await websocket.close(
+                    1008,
+                    "Authorization timeout"
+                )
+                return
+
+            # ----------------------------------------------------
+            # Проверяем авторизацию после ответа
+            # ----------------------------------------------------
+
+            async with lock:
+                authorized_now = (
+                    device_id in authorized_devices_set
+                )
+
+            if not authorized_now:
+                logger.warning(
+                    f"Device {device_id} was not authorized by admin"
+                )
+
+                async with lock:
+                    pending_devices.pop(device_id, None)
+                    pending_auth_events.pop(device_id, None)
+
+                await websocket.close(
+                    1008,
+                    "Device not authorized"
+                )
+                return
+
+            logger.info(
+                f"Device {device_id} authorized, "
+                f"continuing handshake"
+            )
+
+            device.authorized = True
+            device.status = "online"
+
+            save_device_to_db(device)
+
+            async with lock:
+                pending_devices.pop(device_id, None)
+                pending_auth_events.pop(device_id, None)
+
+            save_authorized()
+
+        else:
+            logger.info(
+                f"Device {device_id} is already authorized"
+            )
+
+        # --------------------------------------------------------
+        # Welcome
+        # --------------------------------------------------------
+
         if rate_limiter is None:
             rate_limiter = get_rate_limiter(device_id)
 
-        # Отправляем welcome
-        from yuki_protocol import welcome_message
+        try:
+            from yuki_protocol import welcome_message
+        except Exception as e:
+            logger.exception(
+                f"Cannot import welcome_message: {e}"
+            )
+
+            await websocket.close(
+                1011,
+                "Server misconfiguration: welcome_message missing"
+            )
+            return
+
         welcome = welcome_message(
             session_id=str(uuid.uuid4()),
             server_time=int(time.time()),
             heartbeat_interval=HEARTBEAT_INTERVAL
         )
-        await device.ws.send(welcome.to_json())
-        logger.info(f"Welcome sent to {device.id}")
-        
-        # Проверяем, что WebSocket все еще открыт
-        if device.ws.state.name == "CLOSED":
-            logger.error(f"WebSocket closed immediately after welcome for {device.id}")
-            return
-        
-        device.status = "online"
-        save_device_to_db(device)
-        await notify_webui()
-        logger.info(f"Handshake COMPLETED for {device.id}, status set to online")
 
-        # Небольшая задержка перед запуском задач
+        await websocket.send(
+            welcome.to_json()
+        )
+
+        logger.info(
+            f"Welcome sent to {device.id}"
+        )
+
+        if websocket.state.name == "CLOSED":
+            logger.error(
+                f"WebSocket closed immediately after "
+                f"welcome for {device.id}"
+            )
+            return
+
+        device.status = "online"
+
+        save_device_to_db(device)
+
+        await notify_webui()
+
+        logger.info(
+            f"Handshake COMPLETED for {device.id}, "
+            f"status set to online"
+        )
+
         await asyncio.sleep(0.1)
 
-        # Запускаем задачи
-        receive_task = asyncio.create_task(device_receive_loop(device, websocket, rate_limiter, connect_time))
-        heartbeat_task = asyncio.create_task(heartbeat_monitor(device, websocket))
-        
-        # Ждем завершения ОБЕИХ задач
+        receive_task = asyncio.create_task(
+            device_receive_loop(
+                device,
+                websocket,
+                rate_limiter,
+                connect_time
+            )
+        )
+
+        heartbeat_task = asyncio.create_task(
+            heartbeat_monitor(
+                device,
+                websocket
+            )
+        )
+
         try:
-            await asyncio.gather(receive_task, heartbeat_task)
+            await asyncio.gather(
+                receive_task,
+                heartbeat_task
+            )
+
         except asyncio.CancelledError:
-            logger.info(f"Tasks cancelled for {device.id}")
+            logger.info(
+                f"Tasks cancelled for {device.id}"
+            )
+
         except Exception as e:
-            logger.error(f"Error in tasks: {e}")
-                
+            logger.exception(
+                f"Error in tasks for {device.id}: {e}"
+            )
+
     except asyncio.TimeoutError:
-        logger.warning(f"Device {device_id} handshake timeout")
+        logger.warning(
+            f"Device {device_id} handshake timeout"
+        )
+
     except websockets.exceptions.ConnectionClosed as e:
-        logger.info(f"Device {device_id} connection closed during handshake: {e}")
+        logger.info(
+            f"Device {device_id} connection closed "
+            f"during handshake: {e}"
+        )
+
     except Exception as e:
-        logger.error(f"Unexpected error in handle_device: {e}")
-        if os.environ.get("YUKI_DEBUG"):
-            import traceback
-            traceback.print_exc()
+        logger.exception(
+            f"Unexpected error in handle_device "
+            f"for {device_id}: {e}"
+        )
+
     finally:
+        logger.info(
+            f"handle_device: finally block for {device_id}"
+        )
+
         if device_id:
+            was_current_connection = False
+            device_to_update = None
+
             async with lock:
-                if device_id in connected_devices:
-                    del connected_devices[device_id]
-                if device_id in known_devices:
-                    dev = known_devices[device_id]
-                    dev.mark_offline()
-                    dev.ws = None
-                    save_device_to_db(dev)
-            logger.info(f"Device {device_id} disconnected")
-            audit_log("device_disconnected", device_id, "Connection closed")
+                current = connected_devices.get(device_id)
+
+                # Удаляем только СВОЮ сессию.
+                #
+                # Если уже подключился новый websocket,
+                # старый handle_device ничего не трогает.
+
+                if (
+                    current is device
+                    and device is not None
+                    and device.ws is websocket
+                ):
+                    connected_devices.pop(device_id, None)
+                    was_current_connection = True
+                    device_to_update = device
+
+                    logger.info(
+                        f"Removed {device_id} from connected_devices "
+                        f"(this connection)"
+                    )
+
+                else:
+                    logger.info(
+                        f"Not removing {device_id} from "
+                        f"connected_devices - newer connection exists"
+                    )
+
+                if (
+                    device_to_update is not None
+                    and known_devices.get(device_id) is device
+                ):
+                    device_to_update.mark_offline()
+                    device_to_update.ws = None
+
+            # Сохраняем БД уже после lock.
+            if device_to_update is not None:
+                save_device_to_db(device_to_update)
+
+            # Если соединение завершилось во время авторизации,
+            # будим ожидающий handle_device, чтобы он не висел 60 секунд.
+
+            async with lock:
+                auth_event = pending_auth_events.get(device_id)
+
+            if auth_event is not None:
+                auth_event.set()
+
+                async with lock:
+                    pending_auth_events.pop(device_id, None)
+                    pending_devices.pop(device_id, None)
+
+            if was_current_connection:
+                logger.info(
+                    f"Device {device_id} disconnected"
+                )
+
+            audit_log(
+                "device_disconnected",
+                device_id,
+                "Connection closed"
+            )
+
         await notify_webui()
 
 async def device_receive_loop(device, websocket, rate_limiter, connect_time):
@@ -1156,9 +1536,6 @@ async def await_device_response(request_id: str, from_device, to_device_id: str)
 
 
 async def heartbeat_monitor(device, websocket):
-    # Bound to the specific `websocket` this task was created for, not device.ws - same reasoning
-    # as device_receive_loop (see its comment): device.ws can be reassigned by a newer overlapping
-    # connection for the same device_id while this task is still monitoring the old one.
     consecutive_failures = 0
     max_failures = 3
 
@@ -1167,86 +1544,197 @@ async def heartbeat_monitor(device, websocket):
             await asyncio.sleep(HEARTBEAT_INTERVAL)
 
             if not websocket:
-                logger.warning(f"Heartbeat: device {device.id} has no websocket, stopping monitor")
+                logger.warning(
+                    f"Heartbeat: device {device.id} "
+                    f"has no websocket, stopping monitor"
+                )
                 break
 
-            # Дополнительная проверка - есть ли устройство в connected_devices
-            if device.id not in connected_devices:
-                logger.warning(f"Heartbeat: device {device.id} not in connected_devices, stopping monitor")
-                break
+            async with lock:
+                current = connected_devices.get(device.id)
+
+                # Старый heartbeat не должен убивать новую сессию.
+                if (
+                    current is not device
+                    or device.ws is not websocket
+                ):
+                    logger.info(
+                        f"Heartbeat: newer connection exists "
+                        f"for {device.id}, stopping old monitor"
+                    )
+                    break
 
             if websocket.state.name == "CLOSED":
-                logger.warning(f"Heartbeat: WebSocket for {device.id} is closed")
+                logger.warning(
+                    f"Heartbeat: WebSocket for "
+                    f"{device.id} is closed"
+                )
                 break
 
             try:
-                # Отправляем ping с таймаутом
                 pong_waiter = await websocket.ping()
-                await asyncio.wait_for(pong_waiter, timeout=HEARTBEAT_TIMEOUT)
+
+                await asyncio.wait_for(
+                    pong_waiter,
+                    timeout=HEARTBEAT_TIMEOUT
+                )
+
                 device.update_last_seen()
                 save_device_to_db(device)
+
                 consecutive_failures = 0
-                logger.debug(f"Heartbeat OK for {device.id}")
+
+                logger.debug(
+                    f"Heartbeat OK for {device.id}"
+                )
 
             except asyncio.TimeoutError:
                 consecutive_failures += 1
-                logger.warning(f"Heartbeat timeout for {device.id} (failure {consecutive_failures}/{max_failures})")
+
+                logger.warning(
+                    f"Heartbeat timeout for {device.id} "
+                    f"(failure {consecutive_failures}/{max_failures})"
+                )
+
                 if consecutive_failures >= max_failures:
-                    logger.warning(f"Heartbeat: too many failures for {device.id}, closing connection")
+                    logger.warning(
+                        f"Heartbeat: too many failures "
+                        f"for {device.id}, closing connection"
+                    )
+
                     try:
                         await websocket.close()
-                    except:
+                    except Exception:
                         pass
+
                     break
-                    
+
             except AttributeError as e:
-                logger.error(f"Heartbeat attribute error for {device.id}: {e}")
+                logger.error(
+                    f"Heartbeat attribute error "
+                    f"for {device.id}: {e}"
+                )
                 break
-                
+
             except websockets.exceptions.ConnectionClosed as e:
-                logger.info(f"Heartbeat: connection closed for {device.id}: {e}")
+                logger.info(
+                    f"Heartbeat: connection closed "
+                    f"for {device.id}: {e}"
+                )
                 break
-                
+
             except Exception as e:
-                logger.error(f"Heartbeat unexpected error for {device.id}: {e}")
+                logger.error(
+                    f"Heartbeat unexpected error "
+                    f"for {device.id}: {e}"
+                )
+
                 consecutive_failures += 1
+
                 if consecutive_failures >= max_failures:
                     break
-                
+
     except asyncio.CancelledError:
-        logger.info(f"Heartbeat monitor cancelled for {device.id}")
+        logger.info(
+            f"Heartbeat monitor cancelled for {device.id}"
+        )
+
     except Exception as e:
-        logger.error(f"Heartbeat monitor error for {device.id}: {e}")
+        logger.error(
+            f"Heartbeat monitor error for "
+            f"{device.id}: {e}"
+        )
+
     finally:
-        # Отмечаем устройство как офлайн только если оно еще в connected_devices
+        should_update = False
+
         async with lock:
-            if device.id in connected_devices:
+            current = connected_devices.get(device.id)
+
+            if (
+                current is device
+                and device.ws is websocket
+            ):
                 device.mark_offline()
-                save_device_to_db(device)
+                should_update = True
+
+        if should_update:
+            save_device_to_db(device)
+
         await notify_webui()
-        logger.info(f"Heartbeat monitor stopped for {device.id}")
+
+        logger.info(
+            f"Heartbeat monitor stopped for {device.id}"
+        )
+
 
 async def handle_webui(websocket, path=None):
     ws_id = id(websocket)
 
     try:
-        raw_auth = await asyncio.wait_for(websocket.recv(), timeout=10.0)
+        raw_auth = await asyncio.wait_for(
+            websocket.recv(),
+            timeout=10.0
+        )
+
         auth_data = json.loads(raw_auth)
-    except (asyncio.TimeoutError, ValueError, websockets.exceptions.ConnectionClosed):
-        await websocket.close(1008, "Authentication required")
+
+    except (
+        asyncio.TimeoutError,
+        ValueError,
+        websockets.exceptions.ConnectionClosed
+    ):
+        await websocket.close(
+            1008,
+            "Authentication required"
+        )
         return
 
-    auth_token = auth_data.get("token") if auth_data.get("type") == "auth" else None
-    if current_token is not None and not (auth_token and hmac.compare_digest(auth_token, current_token)):
-        logger.warning("WebUI connection rejected: invalid or missing auth token")
-        audit_log("webui_auth_failed", None, "Invalid token", websocket.remote_address[0] if websocket.remote_address else None)
-        await websocket.close(1008, "Invalid authentication token")
+    auth_token = (
+        auth_data.get("token")
+        if auth_data.get("type") == "auth"
+        else None
+    )
+
+    if (
+        current_token is not None
+        and not (
+            auth_token
+            and hmac.compare_digest(
+                auth_token,
+                current_token
+            )
+        )
+    ):
+        logger.warning(
+            "WebUI connection rejected: "
+            "invalid or missing auth token"
+        )
+
+        audit_log(
+            "webui_auth_failed",
+            None,
+            "Invalid token",
+            websocket.remote_address[0]
+            if websocket.remote_address
+            else None
+        )
+
+        await websocket.close(
+            1008,
+            "Invalid authentication token"
+        )
         return
 
-    await websocket.send(json.dumps({"type": "auth_ok"}))
+    await websocket.send(
+        json.dumps({
+            "type": "auth_ok"
+        })
+    )
 
     async with lock:
         webui_clients.add(websocket)
+
     try:
         await send_devices_to_webui(websocket)
         await send_system_metrics_to_webui(websocket)
@@ -1255,271 +1743,776 @@ async def handle_webui(websocket, path=None):
             try:
                 data = json.loads(message)
                 msg_type = data.get("type")
-                
+
+                # ====================================================
+                # COMMAND
+                # ====================================================
+
                 if msg_type == "command":
-                    # Поддержка обоих форматов
                     if "device_id" in data:
-                        # Старый формат (прямые поля)
                         device_id = data["device_id"]
                         cmd = data["command"]
                         payload = data.get("payload", {})
                         cmd_id = data.get("id")
-                    elif "payload" in data and "device_id" in data["payload"]:
-                        # Новый формат (с payload)
+
+                    elif (
+                        "payload" in data
+                        and "device_id" in data["payload"]
+                    ):
                         device_id = data["payload"]["device_id"]
                         cmd = data["payload"]["command"]
-                        payload = data["payload"].get("params", {})
+                        payload = data["payload"].get(
+                            "params",
+                            {}
+                        )
                         cmd_id = data.get("id")
+
                     else:
-                        logger.warning(f"Invalid command format: {data}")
+                        logger.warning(
+                            f"Invalid command format: {data}"
+                        )
                         continue
-                    
-                    # Rate limiting проверка
+
                     rate_limiter = get_rate_limiter(device_id)
+
                     if not rate_limiter.allow():
-                        await websocket.send(json.dumps({"type": "error", "message": "Rate limit exceeded for this device"}))
+                        await websocket.send(
+                            json.dumps({
+                                "type": "error",
+                                "message": (
+                                    "Rate limit exceeded "
+                                    "for this device"
+                                )
+                            })
+                        )
                         continue
-                    
+
                     if cmd in DANGEROUS_COMMANDS:
                         confirm_id = str(uuid.uuid4())
+
                         pending_confirm_commands[confirm_id] = {
                             "webui_id": cmd_id,
                             "device_id": device_id,
                             "command": cmd,
                             "params": payload
                         }
-                        from yuki_protocol import confirm_command_message
-                        confirm_msg = confirm_command_message(device_id, cmd, payload)
+
+                        from yuki_protocol import (
+                            confirm_command_message
+                        )
+
+                        confirm_msg = confirm_command_message(
+                            device_id,
+                            cmd,
+                            payload
+                        )
+
                         confirm_msg.id = confirm_id
-                        await websocket.send(confirm_msg.to_json())
+
+                        await websocket.send(
+                            confirm_msg.to_json()
+                        )
+
                         continue
-                    
-                    await execute_command(device_id, cmd, payload, cmd_id=cmd_id)
-                    
+
+                    await execute_command(
+                        device_id,
+                        cmd,
+                        payload,
+                        cmd_id=cmd_id
+                    )
+
+                # ====================================================
+                # BROADCAST COMMAND
+                # ====================================================
+
                 elif msg_type == "broadcast_command":
                     cmd = data["command"]
                     payload = data.get("payload", {})
-                    sent = await broadcast_command(cmd, payload)
-                    await websocket.send(json.dumps({"type": "broadcast_result", "sent": sent}))
-                    
+
+                    sent = await broadcast_command(
+                        cmd,
+                        payload
+                    )
+
+                    await websocket.send(
+                        json.dumps({
+                            "type": "broadcast_result",
+                            "sent": sent
+                        })
+                    )
+
+                # ====================================================
+                # SYSTEM METRICS
+                # ====================================================
+
                 elif msg_type == "get_system_metrics":
                     metrics = get_system_metrics()
-                    await websocket.send(json.dumps({"type": "system_metrics", "payload": metrics}))
-                    
+
+                    await websocket.send(
+                        json.dumps({
+                            "type": "system_metrics",
+                            "payload": metrics
+                        })
+                    )
+
+                # ====================================================
+                # UPTIME
+                # ====================================================
+
                 elif msg_type == "get_uptime_stats":
                     device_id = data.get("device_id")
                     days = data.get("days", 7)
-                    stats = get_device_uptime_stats(device_id, days)
-                    await websocket.send(json.dumps({"type": "uptime_stats", "payload": stats}))
-                    
+
+                    stats = get_device_uptime_stats(
+                        device_id,
+                        days
+                    )
+
+                    await websocket.send(
+                        json.dumps({
+                            "type": "uptime_stats",
+                            "payload": stats
+                        })
+                    )
+
+                # ====================================================
+                # BLACKLIST
+                # ====================================================
+
                 elif msg_type == "blacklist_add":
                     device_id = data.get("device_id")
+
                     add_to_blacklist(device_id)
-                    await websocket.send(json.dumps({"type": "blacklist_result", "success": True}))
-                    
+
+                    await websocket.send(
+                        json.dumps({
+                            "type": "blacklist_result",
+                            "success": True
+                        })
+                    )
+
                 elif msg_type == "blacklist_remove":
                     device_id = data.get("device_id")
+
                     remove_from_blacklist(device_id)
-                    await websocket.send(json.dumps({"type": "blacklist_result", "success": True}))
-                    
+
+                    await websocket.send(
+                        json.dumps({
+                            "type": "blacklist_result",
+                            "success": True
+                        })
+                    )
+
                 elif msg_type == "get_blacklist":
-                    await websocket.send(json.dumps({"type": "blacklist", "devices": list(blacklisted_devices)}))
-                    
+                    await websocket.send(
+                        json.dumps({
+                            "type": "blacklist",
+                            "devices": list(
+                                blacklisted_devices
+                            )
+                        })
+                    )
+
+                # ====================================================
+                # AUDIT LOG
+                # ====================================================
+
                 elif msg_type == "get_audit_log":
-                    limit = data.get("limit", 100)
+                    limit = data.get(
+                        "limit",
+                        100
+                    )
+
                     logs = get_audit_log(limit)
-                    await websocket.send(json.dumps({"type": "audit_log", "logs": logs}))
-                    
+
+                    await websocket.send(
+                        json.dumps({
+                            "type": "audit_log",
+                            "logs": logs
+                        })
+                    )
+
+                # ====================================================
+                # CONFIRM RESPONSE
+                # ====================================================
+
                 elif msg_type == "confirm_response":
                     confirm_id = data.get("id")
-                    approved = data.get("approved", False)
-                    if approved and confirm_id in pending_confirm_commands:
-                        info = pending_confirm_commands.pop(confirm_id)
-                        await execute_command(info["device_id"], info["command"], info["params"], cmd_id=info["webui_id"])
+                    approved = data.get(
+                        "approved",
+                        False
+                    )
+
+                    if (
+                        approved
+                        and confirm_id
+                        in pending_confirm_commands
+                    ):
+                        info = (
+                            pending_confirm_commands
+                            .pop(confirm_id)
+                        )
+
+                        await execute_command(
+                            info["device_id"],
+                            info["command"],
+                            info["params"],
+                            cmd_id=info["webui_id"]
+                        )
+
                     else:
-                        pending_confirm_commands.pop(confirm_id, None)
-                        
+                        pending_confirm_commands.pop(
+                            confirm_id,
+                            None
+                        )
+
+                # ====================================================
+                # DEVICE AUTH RESPONSE
+                # ====================================================
+
                 elif msg_type == "device_auth_response":
-                    payload = data.get("payload", {})
-                    device_id = payload.get("device_id")
-                    approved = payload.get("approved", False)
+                    payload = data.get(
+                        "payload",
+                        {}
+                    )
+
+                    device_id = payload.get(
+                        "device_id"
+                    )
+
+                    approved = payload.get(
+                        "approved",
+                        False
+                    )
+
                     async with lock:
-                        device = pending_devices.get(device_id) or known_devices.get(device_id)
-                        auth_event = pending_auth_events.get(device_id)
-                    if device and device.status == "pending":
+                        device = (
+                            pending_devices.get(device_id)
+                            or known_devices.get(device_id)
+                        )
+
+                        auth_event = (
+                            pending_auth_events.get(
+                                device_id
+                            )
+                        )
+
+                    if (
+                        device
+                        and device.status == "pending"
+                    ):
                         if approved:
-                            authorized_devices_set.add(device_id)
+                            async with lock:
+                                authorized_devices_set.add(
+                                    device_id
+                                )
+
                             save_authorized()
+
                             device.authorized = True
                             device.status = "online"
-                            audit_log("device_authorized", device_id, "Approved by admin")
+
+                            audit_log(
+                                "device_authorized",
+                                device_id,
+                                "Approved by admin"
+                            )
+
                         else:
                             device.status = "rejected"
-                            audit_log("device_rejected", device_id, "Rejected by admin")
+
+                            audit_log(
+                                "device_rejected",
+                                device_id,
+                                "Rejected by admin"
+                            )
+
                         if auth_event:
                             auth_event.set()
+
                     await notify_webui()
-                    
+
+                # ====================================================
+                # TOKEN ROTATION
+                # ====================================================
+
                 elif msg_type == "rotate_token":
-                    await perform_token_rotation(reason="admin")
-                    await websocket.send(json.dumps({"type": "token_rotated", "success": True}))
-                    
+                    await perform_token_rotation(
+                        reason="admin"
+                    )
+
+                    await websocket.send(
+                        json.dumps({
+                            "type": "token_rotated",
+                            "success": True
+                        })
+                    )
+
                 elif msg_type == "get_token_info":
                     info = {
                         "type": "token_info",
                         "payload": {
                             "created_at": token_created_at,
-                            "rotation_interval_hours": ROTATION_INTERVAL_HOURS,
+                            "rotation_interval_hours":
+                                ROTATION_INTERVAL_HOURS,
                             "expires_in": None
                         }
                     }
+
                     if token_created_at:
-                        expires_at = token_created_at + ROTATION_INTERVAL_HOURS * 3600
-                        info["payload"]["expires_in"] = max(0, expires_at - time.time())
-                    await websocket.send(json.dumps(info))
-                    
+                        expires_at = (
+                            token_created_at
+                            + ROTATION_INTERVAL_HOURS * 3600
+                        )
+
+                        info["payload"]["expires_in"] = max(
+                            0,
+                            expires_at - time.time()
+                        )
+
+                    await websocket.send(
+                        json.dumps(info)
+                    )
+
+                # ====================================================
+                # DEVICES
+                # ====================================================
+
                 elif msg_type == "get_devices":
-                    await send_devices_to_webui(websocket)
+                    await send_devices_to_webui(
+                        websocket
+                    )
+
                 elif msg_type == "get_device_metrics":
-                    device_id = data.get("device_id")
-                    hours = data.get("hours", 1)
-                    metric_names = data.get("metrics")
-                    metrics = get_device_metrics(device_id, hours, metric_names)
-                    await websocket.send(json.dumps({
-                        "type": "device_metrics",
-                        "device_id": device_id,
-                        "metrics": metrics
-                    }))
+                    device_id = data.get(
+                        "device_id"
+                    )
+
+                    hours = data.get(
+                        "hours",
+                        1
+                    )
+
+                    metric_names = data.get(
+                        "metrics"
+                    )
+
+                    metrics = get_device_metrics(
+                        device_id,
+                        hours,
+                        metric_names
+                    )
+
+                    await websocket.send(
+                        json.dumps({
+                            "type": "device_metrics",
+                            "device_id": device_id,
+                            "metrics": metrics
+                        })
+                    )
 
                 elif msg_type == "get_extended_statuses":
-                    await websocket.send(json.dumps({
-                        "type": "extended_statuses",
-                        "statuses": extended_statuses
-                    }))
+                    await websocket.send(
+                        json.dumps({
+                            "type": "extended_statuses",
+                            "statuses": extended_statuses
+                        })
+                    )
+
+                # ====================================================
+                # REQUEST DEVICE METRICS
+                # ====================================================
 
                 elif msg_type == "request_device_metrics":
-                    device_id = data.get("device_id")
-                    metric_types = data.get("metric_types")
-                    
+                    device_id = data.get(
+                        "device_id"
+                    )
+
+                    metric_types = data.get(
+                        "metric_types"
+                    )
+
                     async with lock:
-                        device = connected_devices.get(device_id)
-                    
-                    if device and device.status == "online":
-                        from yuki_protocol import metrics_request_message
-                        req = metrics_request_message(device_id, metric_types)
-                        await device.send_json(req.to_json())
-                        await websocket.send(json.dumps({
-                            "type": "metrics_requested",
-                            "device_id": device_id,
-                            "success": True
-                        }))
+                        device = connected_devices.get(
+                            device_id
+                        )
+
+                    if (
+                        device
+                        and device.status == "online"
+                    ):
+                        from yuki_protocol import (
+                            metrics_request_message
+                        )
+
+                        req = metrics_request_message(
+                            device_id,
+                            metric_types
+                        )
+
+                        await device.send_json(
+                            req.to_json()
+                        )
+
+                        await websocket.send(
+                            json.dumps({
+                                "type": "metrics_requested",
+                                "device_id": device_id,
+                                "success": True
+                            })
+                        )
+
                     else:
-                        await websocket.send(json.dumps({
-                            "type": "metrics_requested",
-                            "device_id": device_id,
-                            "success": False,
-                            "error": "Device offline"
-                        }))
+                        await websocket.send(
+                            json.dumps({
+                                "type": "metrics_requested",
+                                "device_id": device_id,
+                                "success": False,
+                                "error": "Device offline"
+                            })
+                        )
+
+                # ====================================================
+                # DISCONNECT DEVICE
+                # ====================================================
 
                 elif msg_type == "disconnect_device":
-                    device_id = data.get("device_id")
+                    device_id = data.get(
+                        "device_id"
+                    )
+
                     async with lock:
-                        device = connected_devices.get(device_id)
+                        device = connected_devices.get(
+                            device_id
+                        )
+
                     if device and device.ws:
+                        target_ws = device.ws
+
                         try:
-                            # Отправляем команду на отключение устройству
                             disconnect_msg = {
                                 "protocol": PROTOCOL_VERSION,
                                 "type": "disconnect",
                                 "id": str(uuid.uuid4()),
                                 "timestamp": int(time.time()),
-                                "payload": {"reason": "admin_request"}
+                                "payload": {
+                                    "reason": "admin_request"
+                                }
                             }
-                            await device.ws.send(json.dumps(disconnect_msg))
 
-                            # Закрываем соединение
-                            await asyncio.wait_for(device.ws.close(1000, "Disconnected by admin"), timeout=5)
-                            device.mark_offline()
-                            save_device_to_db(device)
-                            
-                            # Удаляем из connected_devices
-                            if device_id in connected_devices:
-                                del connected_devices[device_id]
-                            
-                            audit_log("device_disconnected", device_id, "Disconnected by admin via WebUI")
-                            await notify_webui()
-                            logger.info(f"Device {device_id} disconnected by admin")
-                            await websocket.send(json.dumps({"type": "disconnect_result", "success": True, "device_id": device_id}))
+                            await target_ws.send(
+                                json.dumps(
+                                    disconnect_msg
+                                )
+                            )
+
                         except Exception as e:
-                            logger.error(f"Failed to disconnect device {device_id}: {e}")
-                            await websocket.send(json.dumps({"type": "disconnect_result", "success": False, "error": str(e)}))
+                            logger.debug(
+                                f"Failed to send disconnect "
+                                f"message to {device_id}: {e}"
+                            )
+
+                        # ------------------------------------------------
+                        # ВАЖНО:
+                        # close НЕ внутри lock.
+                        # ------------------------------------------------
+
+                        try:
+                            await asyncio.wait_for(
+                                target_ws.close(
+                                    1000,
+                                    "Disconnected by admin"
+                                ),
+                                timeout=5
+                            )
+                        except Exception as e:
+                            logger.debug(
+                                f"WebSocket for {device_id} "
+                                f"already closed: {e}"
+                            )
+
+                        async with lock:
+                            if (
+                                connected_devices.get(
+                                    device_id
+                                ) is device
+                            ):
+                                connected_devices.pop(
+                                    device_id,
+                                    None
+                                )
+
+                            if (
+                                known_devices.get(
+                                    device_id
+                                ) is device
+                            ):
+                                device.mark_offline()
+                                device.ws = None
+
+                        save_device_to_db(device)
+
+                        audit_log(
+                            "device_disconnected",
+                            device_id,
+                            "Disconnected by admin via WebUI"
+                        )
+
+                        await notify_webui()
+
+                        logger.info(
+                            f"Device {device_id} "
+                            f"disconnected by admin"
+                        )
+
+                        await websocket.send(
+                            json.dumps({
+                                "type": "disconnect_result",
+                                "success": True,
+                                "device_id": device_id
+                            })
+                        )
+
                     else:
-                        await websocket.send(json.dumps({"type": "disconnect_result", "success": False, "error": "Device not found or already offline"}))
-                        
+                        await websocket.send(
+                            json.dumps({
+                                "type": "disconnect_result",
+                                "success": False,
+                                "error": (
+                                    "Device not found "
+                                    "or already offline"
+                                )
+                            })
+                        )
+
+                # ====================================================
+                # REMOVE DEVICE
+                # ====================================================
+
                 elif msg_type == "remove_device":
-                    # Поддержка обоих форматов: {"device_id": ...} и {"payload": {"device_id": ...}}
-                    device_id = data.get("device_id") or (data.get("payload") or {}).get("device_id")
-                    
+                    device_id = (
+                        data.get("device_id")
+                        or (
+                            data.get("payload")
+                            or {}
+                        ).get("device_id")
+                    )
+
                     if not device_id:
-                        logger.warning(f"remove_device without device_id: {data}")
-                        await websocket.send(json.dumps({
-                            "type": "remove_result",
-                            "success": False,
-                            "error": "Missing device_id"
-                        }))
+                        logger.warning(
+                            f"remove_device without "
+                            f"device_id: {data}"
+                        )
+
+                        await websocket.send(
+                            json.dumps({
+                                "type": "remove_result",
+                                "success": False,
+                                "error": "Missing device_id"
+                            })
+                        )
+
                         continue
 
+                    # ------------------------------------------------
+                    # ШАГ 1.
+                    # Забираем всё необходимое под lock,
+                    # но НИЧЕГО не await-им.
+                    # ------------------------------------------------
+
                     async with lock:
-                        device = connected_devices.get(device_id)
-                        if device and device.ws:
-                            try:
-                                await asyncio.wait_for(device.ws.close(1000, "Device removed by admin"), timeout=5)
-                            except Exception:
-                                pass
-                            if device_id in connected_devices:
-                                del connected_devices[device_id]
+                        device = connected_devices.get(
+                            device_id
+                        )
 
-                        if device_id in known_devices:
-                            del known_devices[device_id]
+                        target_ws = (
+                            device.ws
+                            if device is not None
+                            else None
+                        )
 
-                        # Удаляем из БД с проверкой результата
+                        auth_event = (
+                            pending_auth_events.get(
+                                device_id
+                            )
+                        )
+
+                        # Сразу убираем активное соединение.
+                        if (
+                            connected_devices.get(
+                                device_id
+                            ) is device
+                        ):
+                            connected_devices.pop(
+                                device_id,
+                                None
+                            )
+
+                        # Полностью удаляем объект из памяти.
+                        known_devices.pop(
+                            device_id,
+                            None
+                        )
+
+                        # Удаляем ожидающую авторизацию.
+                        pending_devices.pop(
+                            device_id,
+                            None
+                        )
+
+                        pending_auth_events.pop(
+                            device_id,
+                            None
+                        )
+
+                        # ВАЖНО:
+                        # Удаляем авторизацию из ПАМЯТИ сразу,
+                        # иначе reconnect может пройти без WebUI approval.
+                        authorized_devices_set.discard(
+                            device_id
+                        )
+
+                        blacklisted_devices.discard(
+                            device_id
+                        )
+
+                    # ------------------------------------------------
+                    # ШАГ 2.
+                    # Разбудить handle_device(), если он ждал approval.
+                    # ------------------------------------------------
+
+                    if auth_event is not None:
+                        auth_event.set()
+
+                    # ------------------------------------------------
+                    # ШАГ 3.
+                    # Закрыть websocket ВНЕ lock.
+                    # ------------------------------------------------
+
+                    if target_ws is not None:
                         try:
-                            conn = sqlite3.connect(DB_PATH)
-                            cursor = conn.cursor()
-                            cursor.execute("DELETE FROM devices WHERE device_id = ?", (device_id,))
-                            deleted = cursor.rowcount
-                            cursor.execute("DELETE FROM authorized WHERE device_id = ?", (device_id,))
-                            cursor.execute("DELETE FROM command_history WHERE device_id = ?", (device_id,))
-                            cursor.execute("DELETE FROM device_metrics WHERE device_id = ?", (device_id,))
-                            conn.commit()
-                            conn.close()
-                            logger.info(f"Removed {device_id} from DB (devices rows deleted: {deleted})")
+                            await asyncio.wait_for(
+                                target_ws.close(
+                                    1000,
+                                    "Device removed by admin"
+                                ),
+                                timeout=5
+                            )
                         except Exception as e:
-                            logger.error(f"Failed to remove device from DB: {e}")
+                            logger.debug(
+                                f"WebSocket for removed device "
+                                f"{device_id} already closed: {e}"
+                            )
 
-                        authorized_devices_set.discard(device_id)
-                        remove_from_blacklist(device_id)
+                    # ------------------------------------------------
+                    # ШАГ 4.
+                    # Удаляем данные из БД ВНЕ lock.
+                    # ------------------------------------------------
 
-                        audit_log("device_removed", device_id, "Device removed by admin via WebUI")
-                        await notify_webui()
-                        logger.info(f"Device {device_id} removed by admin")
-                        await websocket.send(json.dumps({
+                    try:
+                        conn = sqlite3.connect(
+                            DB_PATH
+                        )
+
+                        cursor = conn.cursor()
+
+                        cursor.execute(
+                            "DELETE FROM devices "
+                            "WHERE device_id = ?",
+                            (device_id,)
+                        )
+
+                        deleted_devices = (
+                            cursor.rowcount
+                        )
+
+                        cursor.execute(
+                            "DELETE FROM authorized "
+                            "WHERE device_id = ?",
+                            (device_id,)
+                        )
+
+                        cursor.execute(
+                            "DELETE FROM command_history "
+                            "WHERE device_id = ?",
+                            (device_id,)
+                        )
+
+                        cursor.execute(
+                            "DELETE FROM device_metrics "
+                            "WHERE device_id = ?",
+                            (device_id,)
+                        )
+
+                        conn.commit()
+                        conn.close()
+
+                        logger.info(
+                            f"Removed {device_id} from DB "
+                            f"(devices rows deleted: "
+                            f"{deleted_devices})"
+                        )
+
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to remove device "
+                            f"from DB: {e}"
+                        )
+
+                    # ------------------------------------------------
+                    # ШАГ 5.
+                    # Сохраняем новый authorized state.
+                    # ------------------------------------------------
+
+                    save_authorized()
+
+                    # ------------------------------------------------
+                    # ШАГ 6.
+                    # Audit и WebUI - тоже ВНЕ lock.
+                    # ------------------------------------------------
+
+                    audit_log(
+                        "device_removed",
+                        device_id,
+                        "Device removed by admin via WebUI"
+                    )
+
+                    await notify_webui()
+
+                    logger.info(
+                        f"Device {device_id} "
+                        f"removed by admin"
+                    )
+
+                    await websocket.send(
+                        json.dumps({
                             "type": "remove_result",
                             "success": True,
                             "device_id": device_id
-                        }))
+                        })
+                    )
 
-
-                    
             except json.JSONDecodeError:
-                logger.warn("Invalid JSON from WebUI")
+                logger.warning(
+                    "Invalid JSON from WebUI"
+                )
+
             except Exception as e:
-                logger.error(f"WebUI message handling error: {e}")
+                logger.exception(
+                    f"WebUI message handling error: {e}"
+                )
+
     except websockets.exceptions.ConnectionClosed:
-        logger.info("WebUI disconnected")
+        logger.info(
+            "WebUI disconnected"
+        )
+
     finally:
         async with lock:
-            webui_clients.discard(websocket)
+            webui_clients.discard(
+                websocket
+            )
 
 def get_device_uptime_stats(device_id, days=7):
     """Получение статистики uptime из БД"""
