@@ -40,7 +40,10 @@ def init_db():
     """Инициализация базы данных SQLite"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
+    # WAL lets readers/writers run concurrently instead of blocking each other for up to
+    # busy_timeout on every call - the default rollback-journal mode serializes all access.
+    cursor.execute("PRAGMA journal_mode=WAL")
+
     # Таблица известных устройств
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS devices (
@@ -680,8 +683,10 @@ async def handle_device(websocket, path=None):
             if old_device and old_device.ws and old_device.ws != websocket:
                 logger.info(f"Closing old connection for {device_id}")
                 try:
-                    await old_device.ws.close(1000, "New connection")
-                except:
+                    # Bounded: an unresponsive stale connection must never hold up `lock` (and
+                    # therefore every other device/webui connection) indefinitely.
+                    await asyncio.wait_for(old_device.ws.close(1000, "New connection"), timeout=5)
+                except Exception:
                     pass
                 old_device.mark_offline()
                 if device_id in connected_devices:
@@ -773,8 +778,8 @@ async def handle_device(websocket, path=None):
         await asyncio.sleep(0.1)
 
         # Запускаем задачи
-        receive_task = asyncio.create_task(device_receive_loop(device, rate_limiter, connect_time))
-        heartbeat_task = asyncio.create_task(heartbeat_monitor(device))
+        receive_task = asyncio.create_task(device_receive_loop(device, websocket, rate_limiter, connect_time))
+        heartbeat_task = asyncio.create_task(heartbeat_monitor(device, websocket))
         
         # Ждем завершения ОБЕИХ задач
         try:
@@ -807,14 +812,16 @@ async def handle_device(websocket, path=None):
             audit_log("device_disconnected", device_id, "Connection closed")
         await notify_webui()
 
-async def device_receive_loop(device, rate_limiter, connect_time):
+async def device_receive_loop(device, websocket, rate_limiter, connect_time):
+    # Bound to the specific `websocket` this task was created for, not device.ws - device.ws can
+    # be reassigned by a newer overlapping connection for the same device_id while this task is
+    # still running, which previously caused two tasks to call recv() on the same connection.
     try:
-        # Проверяем, существует ли WebSocket
-        if not device.ws:
+        if not websocket:
             logger.error(f"Device {device.id} has no websocket in receive loop")
             return
-            
-        async for message in device.ws:
+
+        async for message in websocket:
             # Пропускаем пустые или слишком короткие сообщения
             if not message or len(message) < 10:
                 continue
@@ -832,7 +839,7 @@ async def device_receive_loop(device, rate_limiter, connect_time):
             if not rate_limiter.allow():
                 logger.warning(f"Rate limit exceeded for device {device.id}")
                 try:
-                    await device.ws.close(1008, "Rate limit exceeded")
+                    await websocket.close(1008, "Rate limit exceeded")
                 except:
                     pass
                 break
@@ -1148,48 +1155,48 @@ async def await_device_response(request_id: str, from_device, to_device_id: str)
             logger.warning(f"Device response timeout for {request_id}")
 
 
-async def heartbeat_monitor(device):
+async def heartbeat_monitor(device, websocket):
+    # Bound to the specific `websocket` this task was created for, not device.ws - same reasoning
+    # as device_receive_loop (see its comment): device.ws can be reassigned by a newer overlapping
+    # connection for the same device_id while this task is still monitoring the old one.
     consecutive_failures = 0
     max_failures = 3
-    
+
     try:
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
-            
-            # Проверяем, есть ли еще WebSocket и устройство ли в connected_devices
-            if not device.ws:
+
+            if not websocket:
                 logger.warning(f"Heartbeat: device {device.id} has no websocket, stopping monitor")
                 break
-            
+
             # Дополнительная проверка - есть ли устройство в connected_devices
             if device.id not in connected_devices:
                 logger.warning(f"Heartbeat: device {device.id} not in connected_devices, stopping monitor")
                 break
-            
-            # Проверяем состояние WebSocket
-            if device.ws.state.name == "CLOSED":
+
+            if websocket.state.name == "CLOSED":
                 logger.warning(f"Heartbeat: WebSocket for {device.id} is closed")
                 break
-            
+
             try:
                 # Отправляем ping с таймаутом
-                pong_waiter = await device.ws.ping()
+                pong_waiter = await websocket.ping()
                 await asyncio.wait_for(pong_waiter, timeout=HEARTBEAT_TIMEOUT)
                 device.update_last_seen()
                 save_device_to_db(device)
                 consecutive_failures = 0
                 logger.debug(f"Heartbeat OK for {device.id}")
-                
+
             except asyncio.TimeoutError:
                 consecutive_failures += 1
                 logger.warning(f"Heartbeat timeout for {device.id} (failure {consecutive_failures}/{max_failures})")
                 if consecutive_failures >= max_failures:
                     logger.warning(f"Heartbeat: too many failures for {device.id}, closing connection")
-                    if device.ws:
-                        try:
-                            await device.ws.close()
-                        except:
-                            pass
+                    try:
+                        await websocket.close()
+                    except:
+                        pass
                     break
                     
             except AttributeError as e:
@@ -1429,9 +1436,9 @@ async def handle_webui(websocket, path=None):
                                 "payload": {"reason": "admin_request"}
                             }
                             await device.ws.send(json.dumps(disconnect_msg))
-                            
+
                             # Закрываем соединение
-                            await device.ws.close(1000, "Disconnected by admin")
+                            await asyncio.wait_for(device.ws.close(1000, "Disconnected by admin"), timeout=5)
                             device.mark_offline()
                             save_device_to_db(device)
                             
@@ -1450,47 +1457,58 @@ async def handle_webui(websocket, path=None):
                         await websocket.send(json.dumps({"type": "disconnect_result", "success": False, "error": "Device not found or already offline"}))
                         
                 elif msg_type == "remove_device":
-                    device_id = data.get("device_id")
+                    # Поддержка обоих форматов: {"device_id": ...} и {"payload": {"device_id": ...}}
+                    device_id = data.get("device_id") or (data.get("payload") or {}).get("device_id")
+                    
+                    if not device_id:
+                        logger.warning(f"remove_device without device_id: {data}")
+                        await websocket.send(json.dumps({
+                            "type": "remove_result",
+                            "success": False,
+                            "error": "Missing device_id"
+                        }))
+                        continue
+
                     async with lock:
-                        # Сначала отключаем, если онлайн
                         device = connected_devices.get(device_id)
                         if device and device.ws:
                             try:
-                                await device.ws.close(1000, "Device removed by admin")
-                            except:
+                                await asyncio.wait_for(device.ws.close(1000, "Device removed by admin"), timeout=5)
+                            except Exception:
                                 pass
                             if device_id in connected_devices:
                                 del connected_devices[device_id]
-                        
-                        # Удаляем из known_devices
+
                         if device_id in known_devices:
                             del known_devices[device_id]
-                        
-                        # Удаляем из БД
+
+                        # Удаляем из БД с проверкой результата
                         try:
                             conn = sqlite3.connect(DB_PATH)
                             cursor = conn.cursor()
                             cursor.execute("DELETE FROM devices WHERE device_id = ?", (device_id,))
+                            deleted = cursor.rowcount
                             cursor.execute("DELETE FROM authorized WHERE device_id = ?", (device_id,))
                             cursor.execute("DELETE FROM command_history WHERE device_id = ?", (device_id,))
                             cursor.execute("DELETE FROM device_metrics WHERE device_id = ?", (device_id,))
                             conn.commit()
                             conn.close()
+                            logger.info(f"Removed {device_id} from DB (devices rows deleted: {deleted})")
                         except Exception as e:
                             logger.error(f"Failed to remove device from DB: {e}")
 
-                        # authorized_devices_set is an in-memory cache of the "authorized" table -
-                        # the raw DELETE above doesn't touch it, so it must be discarded here too,
-                        # otherwise the device is treated as still authorized until core restarts.
                         authorized_devices_set.discard(device_id)
-
-                        # Удаляем из черного списка, если был
                         remove_from_blacklist(device_id)
-                        
+
                         audit_log("device_removed", device_id, "Device removed by admin via WebUI")
                         await notify_webui()
                         logger.info(f"Device {device_id} removed by admin")
-                        await websocket.send(json.dumps({"type": "remove_result", "success": True, "device_id": device_id}))
+                        await websocket.send(json.dumps({
+                            "type": "remove_result",
+                            "success": True,
+                            "device_id": device_id
+                        }))
+
 
                     
             except json.JSONDecodeError:
