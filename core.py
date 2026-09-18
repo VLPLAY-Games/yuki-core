@@ -1478,7 +1478,12 @@ async def handle_webui(websocket, path=None):
                             conn.close()
                         except Exception as e:
                             logger.error(f"Failed to remove device from DB: {e}")
-                        
+
+                        # authorized_devices_set is an in-memory cache of the "authorized" table -
+                        # the raw DELETE above doesn't touch it, so it must be discarded here too,
+                        # otherwise the device is treated as still authorized until core restarts.
+                        authorized_devices_set.discard(device_id)
+
                         # Удаляем из черного списка, если был
                         remove_from_blacklist(device_id)
                         
