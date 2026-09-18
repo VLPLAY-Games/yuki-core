@@ -9,6 +9,8 @@ import os
 import secrets
 import string
 import signal
+import hmac
+import re
 import sqlite3
 import logging
 import psutil
@@ -22,11 +24,17 @@ from collections import defaultdict
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("yuki-core")
 
+_AUTH_TOKEN_RE = re.compile(r'("auth_token"\s*:\s*")[^"]*(")')
+
+def redact_tokens(raw: str) -> str:
+    return _AUTH_TOKEN_RE.sub(r'\1***\2', raw)
+
 # ==================== SQLite БД ====================
 DB_PATH = os.path.join(os.path.dirname(__file__), "yuki_core.db")
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 PROTOCOL_PATH = os.path.join(PROJECT_ROOT, 'libs', 'yuki-protocol', 'python')
 sys.path.insert(0, PROTOCOL_PATH)
+from yuki_protocol import PROTOCOL_VERSION
 
 def init_db():
     """Инициализация базы данных SQLite"""
@@ -512,6 +520,10 @@ def load_token():
     if os.path.exists(TOKEN_FILE):
         with open(TOKEN_FILE, "r", encoding="utf-8") as f:
             current_token = f.read().strip()
+        try:
+            os.chmod(TOKEN_FILE, 0o600)
+        except OSError:
+            pass
     else:
         current_token = None
 
@@ -537,8 +549,10 @@ def generate_new_token(save=True):
         try:
             with open(TOKEN_FILE, "w", encoding="utf-8") as f:
                 f.write(current_token)
+            os.chmod(TOKEN_FILE, 0o600)
             with open(TOKEN_META_FILE, "w", encoding="utf-8") as f:
                 json.dump({"created_at": token_created_at}, f)
+            os.chmod(TOKEN_META_FILE, 0o600)
         except Exception as e:
             logger.error(f"Failed to save token: {e}")
     logger.info(f"Generated new authentication token")
@@ -560,7 +574,7 @@ async def broadcast_command(command, payload, exclude_device=None):
         if device.status == "online" and device.ws:
             cmd_id = str(uuid.uuid4())
             cmd_msg = {
-                "protocol": "yuki/1.0",
+                "protocol": PROTOCOL_VERSION,
                 "type": "command",
                 "id": cmd_id,
                 "timestamp": int(time.time()),
@@ -598,7 +612,7 @@ async def handle_device(websocket, path=None):
 
     try:
         raw_init = await asyncio.wait_for(websocket.recv(), timeout=10.0)
-        logger.info(f"Received initial message: {raw_init[:200] if raw_init else 'empty'}")
+        logger.info(f"Received initial message: {redact_tokens(raw_init)[:200] if raw_init else 'empty'}")
         
         try:
             from yuki_protocol import YukiMessage
@@ -639,7 +653,7 @@ async def handle_device(websocket, path=None):
             return
 
         # Проверка токена
-        token_valid = (current_token is None or auth_token == current_token)
+        token_valid = (current_token is None or (auth_token is not None and hmac.compare_digest(auth_token, current_token)))
         logger.info(f"Token validation: token_valid={token_valid}, has_token={bool(current_token)}")
         
         # Проверка авторизации
@@ -776,8 +790,9 @@ async def handle_device(websocket, path=None):
         logger.info(f"Device {device_id} connection closed during handshake: {e}")
     except Exception as e:
         logger.error(f"Unexpected error in handle_device: {e}")
-        import traceback
-        traceback.print_exc()
+        if os.environ.get("YUKI_DEBUG"):
+            import traceback
+            traceback.print_exc()
     finally:
         if device_id:
             async with lock:
@@ -930,7 +945,7 @@ async def device_receive_loop(device, rate_limiter, connect_time):
                 latest = get_latest_metrics(device.id)
                 if latest:
                     response = {
-                        "protocol": "yuki/1.1",
+                        "protocol": PROTOCOL_VERSION,
                         "type": "metrics",
                         "id": str(uuid.uuid4()),
                         "timestamp": int(time.time()),
@@ -958,7 +973,15 @@ async def device_receive_loop(device, rate_limiter, connect_time):
                         "payload": {"error": "Invalid from_device_id"}
                     }))
                     continue
-                
+
+                if rate_limiter and not rate_limiter.allow():
+                    logger.warning(f"Rate limit exceeded for device {device.id} (device_to_device)")
+                    await device.send_json(json.dumps({
+                        "type": "error",
+                        "payload": {"error": "Rate limit exceeded"}
+                    }))
+                    continue
+
                 async with lock:
                     target_device = connected_devices.get(to_device_id)
                 
@@ -973,7 +996,7 @@ async def device_receive_loop(device, rate_limiter, connect_time):
                 
                 # Формируем сообщение для целевого устройства
                 forward_msg = {
-                    "protocol": "yuki/1.1",
+                    "protocol": PROTOCOL_VERSION,
                     "type": "device_command",
                     "id": msg.id,
                     "timestamp": int(time.time()),
@@ -1026,7 +1049,7 @@ async def device_receive_loop(device, rate_limiter, connect_time):
                     
                     if original_device and original_device.status == "online":
                         response_msg = {
-                            "protocol": "yuki/1.1",
+                            "protocol": PROTOCOL_VERSION,
                             "type": "device_response",
                             "id": original_id,
                             "timestamp": int(time.time()),
@@ -1052,7 +1075,11 @@ async def device_receive_loop(device, rate_limiter, connect_time):
                 if from_device_id != device.id:
                     logger.warning(f"Device {device.id} attempted to spoof broadcast from_device_id")
                     continue
-                
+
+                if rate_limiter and not rate_limiter.allow():
+                    logger.warning(f"Rate limit exceeded for device {device.id} (device_broadcast)")
+                    continue
+
                 async with lock:
                     devices_to_send = []
                     for dev_id, dev in connected_devices.items():
@@ -1066,7 +1093,7 @@ async def device_receive_loop(device, rate_limiter, connect_time):
                 sent_count = 0
                 for target_device in devices_to_send:
                     broadcast_msg = {
-                        "protocol": "yuki/1.1",
+                        "protocol": PROTOCOL_VERSION,
                         "type": "device_broadcast",
                         "id": str(uuid.uuid4()),
                         "timestamp": int(time.time()),
@@ -1194,12 +1221,29 @@ async def heartbeat_monitor(device):
 
 async def handle_webui(websocket, path=None):
     ws_id = id(websocket)
+
+    try:
+        raw_auth = await asyncio.wait_for(websocket.recv(), timeout=10.0)
+        auth_data = json.loads(raw_auth)
+    except (asyncio.TimeoutError, ValueError, websockets.exceptions.ConnectionClosed):
+        await websocket.close(1008, "Authentication required")
+        return
+
+    auth_token = auth_data.get("token") if auth_data.get("type") == "auth" else None
+    if current_token is not None and not (auth_token and hmac.compare_digest(auth_token, current_token)):
+        logger.warning("WebUI connection rejected: invalid or missing auth token")
+        audit_log("webui_auth_failed", None, "Invalid token", websocket.remote_address[0] if websocket.remote_address else None)
+        await websocket.close(1008, "Invalid authentication token")
+        return
+
+    await websocket.send(json.dumps({"type": "auth_ok"}))
+
     async with lock:
         webui_clients.add(websocket)
     try:
         await send_devices_to_webui(websocket)
         await send_system_metrics_to_webui(websocket)
-        
+
         async for message in websocket:
             try:
                 data = json.loads(message)
@@ -1378,7 +1422,7 @@ async def handle_webui(websocket, path=None):
                         try:
                             # Отправляем команду на отключение устройству
                             disconnect_msg = {
-                                "protocol": "yuki/1.0",
+                                "protocol": PROTOCOL_VERSION,
                                 "type": "disconnect",
                                 "id": str(uuid.uuid4()),
                                 "timestamp": int(time.time()),
@@ -1538,7 +1582,7 @@ async def execute_command(device_id: str, cmd: str, payload: dict, cmd_id: str =
         
         start_time = time.time()
         cmd_msg = {
-            "protocol": "yuki/1.0",
+            "protocol": PROTOCOL_VERSION,
             "type": "command",
             "id": cmd_id,
             "timestamp": int(time.time()),
@@ -1699,8 +1743,19 @@ async def main():
         else:
             await websocket.close(1008, "Invalid path")
     
-    server = await websockets.serve(router, "0.0.0.0", 8000)
-    logger.info("Yuki Core WebSocket server started on ws://0.0.0.0:8000")
+    ssl_context = None
+    if os.environ.get("YUKI_TLS_ENABLED", "").lower() in ("1", "true", "yes"):
+        import ssl
+        cert_path = os.environ.get("YUKI_TLS_CERT")
+        key_path = os.environ.get("YUKI_TLS_KEY")
+        if cert_path and key_path:
+            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ssl_context.load_cert_chain(cert_path, key_path)
+        else:
+            logger.error("YUKI_TLS_ENABLED is set but YUKI_TLS_CERT/YUKI_TLS_KEY are missing, staying on plain ws://")
+
+    server = await websockets.serve(router, "0.0.0.0", 8000, ssl=ssl_context, max_size=2 * 1024 * 1024)
+    logger.info(f"Yuki Core WebSocket server started on {'wss' if ssl_context else 'ws'}://0.0.0.0:8000")
     
     try:
         await server.wait_closed()
