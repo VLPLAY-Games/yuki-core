@@ -10,6 +10,7 @@ import secrets
 import string
 import signal
 import hmac
+import hashlib
 import re
 import sqlite3
 import logging
@@ -228,6 +229,16 @@ def get_rate_limiter(device_id):
     if device_id not in device_rate_limiters:
         device_rate_limiters[device_id] = DeviceRateLimiter(device_id, 60)
     return device_rate_limiters[device_id]
+
+# Separate from the per-device_id limiter above: that one is keyed by whatever device_id the
+# handshake claims, so one IP can brute-force many different device_ids each getting its own
+# fresh limit. This one is keyed by source IP instead, checked before device_id is even trusted.
+ip_handshake_limiters = {}
+
+def get_ip_handshake_limiter(ip):
+    if ip not in ip_handshake_limiters:
+        ip_handshake_limiters[ip] = DeviceRateLimiter(ip, commands_per_minute=20)
+    return ip_handshake_limiters[ip]
 
 # ==================== Системные метрики ====================
 last_net_io = None
@@ -507,19 +518,41 @@ def save_device_metric(device_id, metric_type, value):
 TOKEN_FILE = os.path.join(os.path.dirname(__file__), ".token")
 TOKEN_META_FILE = os.path.join(os.path.dirname(__file__), ".token_meta")
 ROTATION_INTERVAL_HOURS = int(os.environ.get("YUKI_TOKEN_ROTATION_HOURS", "24"))
+GRACE_PERIOD_MINUTES = int(os.environ.get("YUKI_TOKEN_GRACE_MINUTES", "30"))
 
 current_token = None
 token_created_at = None
+token_from_env = False  # set when the token is admin-managed (env var / systemd credential) - core must never rotate it
+
+# Kept valid for GRACE_PERIOD_MINUTES after a rotation so devices that were offline at the moment
+# of rotation (and so never received the token_update push) aren't locked out until they notice.
+previous_token = None
+previous_token_expires_at = None
 
 def load_token():
-    global current_token, token_created_at
+    global current_token, token_created_at, token_from_env
     env_token = os.environ.get("YUKI_AUTH_TOKEN")
     if env_token:
         current_token = env_token
         token_created_at = None
+        token_from_env = True
         logger.info("Using authentication token from environment variable (rotation disabled)")
         return
 
+    # systemd credential: `LoadCredential=yuki_auth_token:/path/to/file` exposes
+    # $CREDENTIALS_DIRECTORY/yuki_auth_token - preferred over the plaintext file below.
+    cred_dir = os.environ.get("CREDENTIALS_DIRECTORY")
+    if cred_dir:
+        cred_path = os.path.join(cred_dir, "yuki_auth_token")
+        if os.path.exists(cred_path):
+            with open(cred_path, "r", encoding="utf-8") as f:
+                current_token = f.read().strip()
+            token_created_at = None
+            token_from_env = True
+            logger.info("Using authentication token from systemd credential (rotation disabled)")
+            return
+
+    token_from_env = False
     if os.path.exists(TOKEN_FILE):
         with open(TOKEN_FILE, "r", encoding="utf-8") as f:
             current_token = f.read().strip()
@@ -560,6 +593,36 @@ def generate_new_token(save=True):
             logger.error(f"Failed to save token: {e}")
     logger.info(f"Generated new authentication token")
     return current_token
+
+def _candidate_tokens():
+    """Current token, plus the previous one while its post-rotation grace period hasn't expired."""
+    candidates = []
+    if current_token is not None:
+        candidates.append(current_token)
+    if previous_token is not None and previous_token_expires_at and time.time() < previous_token_expires_at:
+        candidates.append(previous_token)
+    return candidates
+
+def verify_plain_token(auth_token):
+    """Legacy handshake: the device sent its token directly in `hello`."""
+    if current_token is None:
+        return True
+    if not auth_token:
+        return False
+    return any(hmac.compare_digest(auth_token, tok) for tok in _candidate_tokens())
+
+def verify_challenge_response(nonce_c, nonce_s, provided_hmac):
+    """New handshake: the device proves it knows the token without ever sending it."""
+    if current_token is None:
+        return True
+    if not provided_hmac or not nonce_c or not nonce_s:
+        return False
+    message = f"{nonce_c}:{nonce_s}".encode()
+    for tok in _candidate_tokens():
+        expected = hmac.new(tok.encode(), message, hashlib.sha256).hexdigest()
+        if hmac.compare_digest(expected, provided_hmac):
+            return True
+    return False
 
 load_token()
 
@@ -615,6 +678,14 @@ async def handle_device(websocket, path=None):
 
     logger.info("handle_device: entered")
 
+    remote_ip = websocket.remote_address[0] if websocket.remote_address else "unknown"
+    if not get_ip_handshake_limiter(remote_ip).allow():
+        # Per-IP, independent of the per-device_id limiter below - that one lets an attacker
+        # brute-force many different device_ids from a single IP, each getting its own fresh quota.
+        logger.warning(f"Handshake rate limit exceeded for IP {remote_ip}")
+        await websocket.close(1008, "Too many handshake attempts")
+        return
+
     try:
         raw_init = await asyncio.wait_for(websocket.recv(), timeout=10.0)
         logger.info(
@@ -649,6 +720,7 @@ async def handle_device(websocket, path=None):
         device_type = init_msg.payload.get("device_type")
         capabilities = init_msg.payload.get("capabilities", [])
         auth_token = init_msg.payload.get("auth_token")
+        nonce_c = init_msg.payload.get("nonce_c")
 
         if not device_id or not device_type:
             logger.warning(
@@ -688,18 +760,49 @@ async def handle_device(websocket, path=None):
             )
             return
 
-        token_valid = (
-            current_token is None
-            or (
-                auth_token is not None
-                and hmac.compare_digest(auth_token, current_token)
-            )
-        )
+        if nonce_c:
+            # New handshake: the token never travels over the network, even without TLS.
+            # hello{nonce_c} -> challenge{nonce_s} -> auth{hmac(token, nonce_c:nonce_s)}
+            nonce_s = secrets.token_hex(16)
+            challenge_msg = {
+                "protocol": PROTOCOL_VERSION,
+                "type": "challenge",
+                "id": str(uuid.uuid4()),
+                "timestamp": int(time.time()),
+                "payload": {"nonce_s": nonce_s}
+            }
+            await websocket.send(json.dumps(challenge_msg))
+
+            try:
+                raw_auth = await asyncio.wait_for(websocket.recv(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning(f"Device {device_id} did not respond to challenge in time")
+                await websocket.close(1008, "Challenge response timeout")
+                return
+
+            try:
+                auth_data = json.loads(raw_auth)
+            except ValueError:
+                logger.warning(f"Device {device_id} sent invalid auth response")
+                await websocket.close(1003, "Invalid auth response")
+                return
+
+            if auth_data.get("type") != "auth":
+                logger.warning(f"Device {device_id} sent '{auth_data.get('type')}' instead of 'auth'")
+                await websocket.close(1003, "Expected 'auth' message")
+                return
+
+            provided_hmac = auth_data.get("payload", {}).get("hmac", "")
+            token_valid = verify_challenge_response(nonce_c, nonce_s, provided_hmac)
+        else:
+            # Legacy handshake: token sent directly in hello (still supported for older devices).
+            token_valid = verify_plain_token(auth_token)
 
         logger.info(
             f"Token validation: "
             f"token_valid={token_valid}, "
-            f"has_token={bool(current_token)}"
+            f"has_token={bool(current_token)}, "
+            f"method={'challenge' if nonce_c else 'legacy'}"
         )
 
         if not token_valid:
@@ -1668,8 +1771,40 @@ async def heartbeat_monitor(device, websocket):
         )
 
 
+def _default_webui_origins():
+    env_val = os.environ.get("YUKI_WEBUI_ALLOWED_ORIGINS")
+    if env_val:
+        return {o.strip() for o in env_val.split(",") if o.strip()}
+    # Default assumes yuki-webui runs on its own default port (5000) on the same host as core.
+    # Override YUKI_WEBUI_ALLOWED_ORIGINS if you bind it somewhere else.
+    return {
+        "http://localhost:5000", "https://localhost:5000",
+        "http://127.0.0.1:5000", "https://127.0.0.1:5000",
+    }
+
+WEBUI_ALLOWED_ORIGINS = _default_webui_origins()
+
+def _webui_origin_allowed(websocket):
+    try:
+        origin = websocket.request.headers.get("Origin")
+    except Exception:
+        origin = None
+    if origin is None:
+        return True  # non-browser clients (scripts/CLI tools) don't send an Origin header at all
+    return origin in WEBUI_ALLOWED_ORIGINS
+
 async def handle_webui(websocket, path=None):
     ws_id = id(websocket)
+
+    if not _webui_origin_allowed(websocket):
+        origin = None
+        try:
+            origin = websocket.request.headers.get("Origin")
+        except Exception:
+            pass
+        logger.warning(f"WebUI connection rejected: disallowed Origin '{origin}'")
+        await websocket.close(1008, "Origin not allowed")
+        return
 
     try:
         raw_auth = await asyncio.wait_for(
@@ -1696,16 +1831,7 @@ async def handle_webui(websocket, path=None):
         else None
     )
 
-    if (
-        current_token is not None
-        and not (
-            auth_token
-            and hmac.compare_digest(
-                auth_token,
-                current_token
-            )
-        )
-    ):
+    if not verify_plain_token(auth_token):
         logger.warning(
             "WebUI connection rejected: "
             "invalid or missing auth token"
@@ -2715,10 +2841,17 @@ def save_authorized():
         logger.error(f"Failed to save authorized devices: {e}")
 
 async def perform_token_rotation(reason="admin"):
-    global current_token
+    global current_token, previous_token, previous_token_expires_at
+    if token_from_env:
+        logger.warning("Ignoring token rotation: token is admin-managed (YUKI_AUTH_TOKEN / systemd credential)")
+        return current_token
+
+    previous_token = current_token
+    previous_token_expires_at = time.time() + GRACE_PERIOD_MINUTES * 60
+
     new_token = generate_new_token(save=True)
-    logger.info(f"Token rotated ({reason})")
-    
+    logger.info(f"Token rotated ({reason}), previous token stays valid for {GRACE_PERIOD_MINUTES} more minutes")
+
     async with lock:
         devices = list(connected_devices.values())
     if devices:
@@ -2735,6 +2868,19 @@ async def perform_token_rotation(reason="admin"):
                     logger.warn(f"Failed to send new token to {device.id}: {e}")
     return new_token
 
+async def token_rotation_scheduler():
+    """Makes ROTATION_INTERVAL_HOURS actually happen instead of only rotating on manual request."""
+    while True:
+        await asyncio.sleep(300)
+        try:
+            if token_from_env or token_created_at is None:
+                continue
+            if time.time() - token_created_at >= ROTATION_INTERVAL_HOURS * 3600:
+                logger.info("Automatic token rotation triggered")
+                await perform_token_rotation(reason="automatic")
+        except Exception as e:
+            logger.error(f"Token rotation scheduler error: {e}")
+
 from contextlib import suppress
 
 # Инициализация БД и загрузка данных
@@ -2748,7 +2894,8 @@ async def main():
     # Запускаем фоновые задачи
     asyncio.create_task(system_metrics_scheduler())
     asyncio.create_task(log_rotation_scheduler())
-    
+    asyncio.create_task(token_rotation_scheduler())
+
     async def router(websocket, path=None):
         if path is None:
             path = getattr(getattr(websocket, "request", None), "path", None) or getattr(websocket, "path", None)
@@ -2758,17 +2905,21 @@ async def main():
             await handle_webui(websocket, path)
         else:
             await websocket.close(1008, "Invalid path")
-    
+
     ssl_context = None
     if os.environ.get("YUKI_TLS_ENABLED", "").lower() in ("1", "true", "yes"):
         import ssl
         cert_path = os.environ.get("YUKI_TLS_CERT")
         key_path = os.environ.get("YUKI_TLS_KEY")
-        if cert_path and key_path:
-            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            ssl_context.load_cert_chain(cert_path, key_path)
-        else:
-            logger.error("YUKI_TLS_ENABLED is set but YUKI_TLS_CERT/YUKI_TLS_KEY are missing, staying on plain ws://")
+        if not cert_path or not key_path:
+            # No silent fallback: an admin who set YUKI_TLS_ENABLED=1 believes traffic is
+            # encrypted - starting in plaintext anyway would betray that without them noticing.
+            raise RuntimeError(
+                "YUKI_TLS_ENABLED=1 but YUKI_TLS_CERT/YUKI_TLS_KEY are not set (or point to "
+                "missing files) - refusing to start in plaintext when TLS was explicitly requested"
+            )
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_context.load_cert_chain(cert_path, key_path)
 
     server = await websockets.serve(router, "0.0.0.0", 8000, ssl=ssl_context, max_size=2 * 1024 * 1024)
     logger.info(f"Yuki Core WebSocket server started on {'wss' if ssl_context else 'ws'}://0.0.0.0:8000")
